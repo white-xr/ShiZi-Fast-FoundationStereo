@@ -5,7 +5,7 @@
 #   python scripts/run_config.py --config configs/stereo_infer.yaml --dry_run
 
 model_dir: weights/15-44-51/model_best_bp2_serialize.pth
-intrinsic_file: /home/depthai/well6.12/K.txt
+intrinsic_file: workspace/data/data-50mm/K.txt
 
 # 数据和输出统一放在 workspace 下：
 #   workspace/data    放输入数据
@@ -66,15 +66,29 @@ transfer:
     - depth_vis.png
     - cloud.ply
     - cloud_denoise.ply
+    - merged_cloud.ply
+
+# 可选：批量结束后，把每张 cloud.ply 按位姿变换到统一世界坐标系并融合。
+# 注意：当前采集数据自带的 pose_note.txt 写明没有记录位姿。
+# 需要你后续提供 poses.csv，格式如下：
+# frame_id,m00,m01,m02,m03,m10,m11,m12,m13,m20,m21,m22,m23,m30,m31,m32,m33
+# 000001,1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1
+# 矩阵含义为 T_world_camera，平移单位为 m。
+fusion:
+  enabled: true
+  pose_file: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/poses.csv
+  output_file: merged_cloud.ply
+  voxel_size: 0.002
+  missing_pose_policy: error
 
 batch:
   left_dir: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/left_rgb
   right_dir: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/right_rgb
   pattern: "*.png"
 
-  # 先保留一个编号做快速测试。
-  # 想跑整个文件夹时，改成 ids: [] 或直接删除 ids 这一行。
-  ids: ["000411"]
+  # 默认 ids: [] 跑整个文件夹。
+  # 如果只想快速测试一张，可改成 ids: ["000411"]。
+  ids: []
 
   # 批量跑整个文件夹时，可以按编号范围或数量限制。
   # start: "000100"

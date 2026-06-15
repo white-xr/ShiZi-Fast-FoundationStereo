@@ -1,4 +1,5 @@
 import argparse
+import csv
 from datetime import datetime
 import html
 import logging
@@ -7,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import yaml
 from omegaconf import OmegaConf
 
@@ -15,6 +17,7 @@ repo_dir = code_dir.parent
 sys.path.append(str(repo_dir))
 
 from scripts import run_demo
+from Utils import o3d
 
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
@@ -24,6 +27,13 @@ DEFAULT_TRANSFER_FILES = [
   'depth_vis.png',
   'cloud.ply',
   'cloud_denoise.ply',
+  'merged_cloud.ply',
+]
+POSE_COLUMNS = [
+  'm00', 'm01', 'm02', 'm03',
+  'm10', 'm11', 'm12', 'm13',
+  'm20', 'm21', 'm22', 'm23',
+  'm30', 'm31', 'm32', 'm33',
 ]
 
 
@@ -158,6 +168,87 @@ def make_run_name(config):
   return datetime.now().strftime(str(config.get('run_dir_format', '%m%d%H%M')))
 
 
+def load_pose_file(path):
+  if not path:
+    raise ValueError('fusion.enabled=true 时必须设置 fusion.pose_file。')
+  pose_path = resolve_path(path)
+  if not pose_path.exists():
+    raise FileNotFoundError(f'融合已开启，但找不到位姿文件：{pose_path}')
+
+  poses = {}
+  with open(pose_path, 'r', encoding='utf-8-sig', newline='') as f:
+    reader = csv.DictReader(f)
+    missing_columns = ['frame_id', *POSE_COLUMNS]
+    missing_columns = [name for name in missing_columns if name not in (reader.fieldnames or [])]
+    if missing_columns:
+      raise ValueError(f'位姿文件缺少列：{", ".join(missing_columns)}')
+
+    for row in reader:
+      frame_id = str(row['frame_id']).strip()
+      if not frame_id:
+        continue
+      values = [float(row[name]) for name in POSE_COLUMNS]
+      poses[frame_id] = np.array(values, dtype=np.float64).reshape(4, 4)
+  return poses
+
+
+def validate_fusion_poses(pairs, poses, missing_pose_policy):
+  missing = [pair['name'] for pair in pairs if pair['name'] not in poses]
+  if missing and missing_pose_policy == 'error':
+    preview = ', '.join(missing[:10])
+    suffix = ' ...' if len(missing) > 10 else ''
+    raise ValueError(f'位姿文件缺少 {len(missing)} 帧：{preview}{suffix}')
+  return missing
+
+
+def merge_point_clouds(base_out_dir, results, fusion, poses):
+  if not fusion or not fusion.get('enabled', False):
+    return None
+  if o3d is None:
+    raise RuntimeError('融合点云需要 open3d，但当前环境没有导入成功。')
+
+  missing_pose_policy = fusion.get('missing_pose_policy', 'error')
+  merged = o3d.geometry.PointCloud()
+  used = 0
+  skipped = []
+
+  for result in results:
+    name = result['name']
+    pose = poses.get(name)
+    if pose is None:
+      if missing_pose_policy == 'skip':
+        skipped.append(name)
+        continue
+      raise ValueError(f'位姿文件缺少帧：{name}')
+
+    cloud_path = base_out_dir / result['rel'] / 'cloud.ply'
+    if not cloud_path.exists():
+      logging.warning(f'跳过融合，未找到点云：{cloud_path}')
+      continue
+
+    cloud = o3d.io.read_point_cloud(str(cloud_path))
+    cloud.transform(pose)
+    merged += cloud
+    used += 1
+
+  if used == 0:
+    raise RuntimeError('没有可用于融合的点云。')
+
+  voxel_size = float(fusion.get('voxel_size', 0.0) or 0.0)
+  if voxel_size > 0:
+    logging.info(f'融合点云体素降采样：{voxel_size} m')
+    merged = merged.voxel_down_sample(voxel_size=voxel_size)
+
+  output_file = fusion.get('output_file', 'merged_cloud.ply')
+  output_path = base_out_dir / output_file
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  o3d.io.write_point_cloud(str(output_path), merged)
+  logging.info(f'融合点云已保存：{output_path}，使用 {used} 个点云')
+  if skipped:
+    logging.info(f'融合跳过 {len(skipped)} 帧缺失位姿。')
+  return output_path
+
+
 def write_batch_index(out_dir, results):
   rows = []
   for result in results:
@@ -167,6 +258,10 @@ def write_batch_index(out_dir, results):
       f'<section><a href="{rel}/index.html"><h2>{name}</h2>'
       f'<img src="{rel}/depth_vis.png" alt="{name} depth"></a></section>'
     )
+  root_links = []
+  for path in sorted(out_dir.glob('*.ply')):
+    name = html.escape(path.name)
+    root_links.append(f'<li><a href="{name}">{name}</a></li>')
 
   page = f"""<!doctype html>
 <html lang="en">
@@ -182,10 +277,12 @@ def write_batch_index(out_dir, results):
     a {{ color: inherit; text-decoration: none; }}
     h2 {{ margin: 0 0 8px; font-size: 15px; }}
     img {{ width: 100%; display: block; background: #111; }}
+    ul {{ margin-top: 18px; }}
   </style>
 </head>
 <body>
   <h1>Stereo batch results</h1>
+  <ul>{''.join(root_links)}</ul>
   <main>{''.join(rows)}</main>
 </body>
 </html>
@@ -311,6 +408,12 @@ def main():
   if args.dry_run:
     return
 
+  fusion = config.get('fusion', {})
+  poses = None
+  if fusion and fusion.get('enabled', False):
+    poses = load_pose_file(fusion.get('pose_file'))
+    validate_fusion_poses(pairs, poses, fusion.get('missing_pose_policy', 'error'))
+
   output_root = resolve_path(config.get('out_dir', 'workspace/output'))
   run_name = make_run_name(config)
   base_out_dir = output_root / run_name
@@ -339,6 +442,10 @@ def main():
     run_demo.run_pair(model, sample_args, clean_out_dir=overwrite)
     transfer_outputs(sample_out_dir, f'{run_name}/{pair["name"]}', transfer)
     results.append({'name': pair['name'], 'rel': pair['name']})
+
+  merged_path = merge_point_clouds(base_out_dir, results, fusion, poses)
+  if merged_path is not None:
+    transfer_outputs(base_out_dir, run_name, transfer)
 
   write_batch_index(base_out_dir, results)
   logging.info(f'Batch index: {base_out_dir / "index.html"}')
