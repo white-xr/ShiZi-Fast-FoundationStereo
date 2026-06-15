@@ -1,0 +1,88 @@
+# 启动命令：
+#   python scripts/run_config.py --config configs/stereo_infer.yaml
+#
+# 先检查会跑哪些图片，不真正推理：
+#   python scripts/run_config.py --config configs/stereo_infer.yaml --dry_run
+
+model_dir: weights/15-44-51/model_best_bp2_serialize.pth
+intrinsic_file: /home/depthai/well6.12/K.txt
+
+# 数据和输出统一放在 workspace 下：
+#   workspace/data    放输入数据
+#   workspace/output  放推理输出
+# 每次运行会自动创建子目录，格式为“月份日期时分钟”，例如 workspace/output/06151130/
+out_dir: workspace/output
+run_dir_format: "%m%d%H%M"
+
+valid_iters: 8
+max_disp: 192
+scale: 1
+hiera: 0
+remove_invisible: 1
+
+# get_pc=1 会保存 cloud.ply 点云。
+# 只要设置了 intrinsic_file，就会保存深度文件：
+#   depth_meter.npy  浮点深度，单位 m
+#   depth_mm.png     16 位深度原图，单位 mm
+#   depth_vis.png    深度可视化图，方便无头环境查看
+get_pc: 1
+zfar: 100
+denoise_cloud: 0
+denoise_nb_points: 30
+denoise_radius: 0.03
+
+# 无头环境建议保持 0。只有本机桌面有 DISPLAY 时再改成 1。
+show: 0
+overwrite: true
+
+# 可选：通过 SSH/SCP 把深度和点云传到 Windows。
+# 使用前需要在 Windows 开启 OpenSSH Server，并确认 Linux 能 ssh 到 Windows：
+#   ssh 你的Windows用户名@192.168.1.95
+# 也可以只测试传输配置，不跑模型：
+#   python scripts/run_config.py --config configs/stereo_infer.yaml --check_transfer
+transfer:
+  enabled: true
+
+  # 如果网络变化，替换成新的 Windows IPv4 地址。
+  host: 192.168.1.95
+
+  # Windows 登录用户名
+  user: shizi
+  port: 22
+  timeout_sec: 20
+
+  # Windows 保存根目录。建议用正斜杠写法，避免 YAML 转义问题。
+  # 每个样本会上传到运行子目录，例如 D:/FAST-FS/06151130/000411/
+  remote_dir: D:/FAST-FS
+  create_remote_dir: true
+
+  # false 表示上传失败只报警，不中断批量推理。
+  fail_on_error: false
+
+  # 默认只传深度和点云相关文件；需要更多文件可以继续加。
+  files:
+    - depth_meter.npy
+    - depth_mm.png
+    - depth_vis.png
+    - cloud.ply
+    - cloud_denoise.ply
+
+batch:
+  left_dir: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/left_rgb
+  right_dir: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/right_rgb
+  pattern: "*.png"
+
+  # 先保留一个编号做快速测试。
+  # 想跑整个文件夹时，改成 ids: [] 或直接删除 ids 这一行。
+  ids: ["000411"]
+
+  # 批量跑整个文件夹时，可以按编号范围或数量限制。
+  # start: "000100"
+  # end: "000500"
+  # limit: 20
+
+# 如果不想用 batch，也可以改成单张模式：
+# single:
+#   name: "000411"
+#   left_file: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/left_rgb/000411.png
+#   right_file: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/right_rgb/000411.png

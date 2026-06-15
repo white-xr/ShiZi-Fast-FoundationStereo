@@ -1,4 +1,5 @@
-__pycache__
+__pycache__/
+**/__pycache__/
 *.vscode
 cfg.yaml
 *.pth
@@ -9,6 +10,9 @@ cfg.yaml
 # Ignore weight files but keep the folder structure
 weights/*
 !weights/.gitkeep
-output/
+output*/
+workspace/
+workespace/
+data-50mm/
 .claude/
 cpp/build/
