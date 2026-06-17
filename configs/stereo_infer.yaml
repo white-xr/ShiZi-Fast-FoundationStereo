@@ -47,8 +47,28 @@ show: 1
 overwrite: true
 
 # 可选：通过 SSH/SCP 把深度和点云传到 Windows。
+# 使用前需要在 Windows 开启 OpenSSH Server，并确认 Linux 能 ssh 到 Windows：
+#   ssh 你的Windows用户名@192.168.1.95
+# 也可以只测试传输配置，不跑模型：
+#   python scripts/run_config.py --config configs/stereo_infer.yaml --check_transfer
 transfer:
   enabled: false
+
+  # 如果网络变化，替换成新的 Windows IPv4 地址。
+  host: 192.168.1.95
+
+  # Windows 登录用户名
+  user: shizi
+  port: 22
+  timeout_sec: 20
+
+  # Windows 保存根目录。建议用正斜杠写法，避免 YAML 转义问题。
+  # 每个样本会上传到运行子目录，例如 D:/FAST-FS/06151130_2/000411/
+  remote_dir: D:/FAST-FS
+  create_remote_dir: true
+
+  # false 表示上传失败只报警，不中断批量推理。
+  fail_on_error: false
 
   # 默认只传深度和点云相关文件；需要更多文件可以继续加。
   files:
@@ -58,6 +78,15 @@ transfer:
     - cloud.ply
     - cloud_denoise.ply
     - merged_cloud.ply
+
+# 可选：批量结束后，把每张 cloud.ply 按位姿变换到统一世界坐标系并融合。
+# 如果没有 poses.csv，保持 enabled: false。
+fusion:
+  enabled: false
+  pose_file: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/poses.csv
+  output_file: merged_cloud.ply
+  voxel_size: 0.002
+  missing_pose_policy: error
 
 batch:
   pattern: "*.png"
