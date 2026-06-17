@@ -213,7 +213,55 @@ def make_run_name(config):
   run_name = config.get('run_name')
   if run_name:
     return str(run_name)
-  return datetime.now().strftime(str(config.get('run_dir_format', '%m%d%H%M')))
+
+  name = datetime.now().strftime(str(config.get('run_dir_format', '%m%d%H%M')))
+  if config.get('append_data_name_to_run_dir', True):
+    data_name = config.get('run_dir_data_name') or dataset_source_name(config)
+    data_name = safe_run_name_part(data_name)
+    if data_name:
+      name = f'{name}_{data_name}'
+  return name
+
+
+def safe_run_name_part(value):
+  if value is None:
+    return ''
+  bad_chars = set('/\\:*?"<>|')
+  text = ''.join('_' if ch in bad_chars or ch.isspace() else ch for ch in str(value).strip())
+  return text.strip('._')
+
+
+def dataset_source_name(config):
+  data_dir = get_data_dir(config)
+  if data_dir is not None:
+    return data_dir.name
+
+  batch = config.get('batch') or {}
+  left_dir = batch.get('left_dir')
+  if left_dir:
+    path = resolve_path(left_dir)
+    return path.parent.name if path.name in {'left_rgb', 'right_rgb'} else path.name
+
+  single = config.get('single') or {}
+  left_file = single.get('left_file')
+  if left_file:
+    return resolve_path(left_file).parent.parent.name
+
+  return ''
+
+
+def unique_output_dir(output_root, run_name, keep_exact=False):
+  output_dir = output_root / run_name
+  if keep_exact or not output_dir.exists():
+    return output_dir, run_name
+
+  for idx in range(2, 1000):
+    candidate_name = f'{run_name}_{idx:02d}'
+    candidate = output_root / candidate_name
+    if not candidate.exists():
+      return candidate, candidate_name
+
+  raise RuntimeError(f'输出目录重名太多，请手动设置 run_name：{output_dir}')
 
 
 def load_pose_file(path):
@@ -466,7 +514,7 @@ def main():
 
   output_root = resolve_path(config.get('out_dir', 'workspace/output'))
   run_name = make_run_name(config)
-  base_out_dir = output_root / run_name
+  base_out_dir, run_name = unique_output_dir(output_root, run_name, keep_exact=bool(config.get('run_name')))
   base_out_dir.mkdir(parents=True, exist_ok=True)
   overwrite = bool(config.get('overwrite', True))
   transfer = config.get('transfer', {})
