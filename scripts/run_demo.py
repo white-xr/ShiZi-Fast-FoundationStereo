@@ -63,6 +63,11 @@ def configure_runtime():
 
 def load_model(args):
   model = torch.load(args.model_dir, map_location='cpu', weights_only=False)
+  if isinstance(model, dict):
+    raise TypeError(
+      f'{args.model_dir} 是 checkpoint 字典，不是可直接推理的序列化模型。'
+      '请把 model_dir 改成 *_serialize.pth，例如 weights/15-44-51/model_best_bp2_serialize.pth。'
+    )
   model.args.valid_iters = args.valid_iters
   model.args.max_disp = args.max_disp
   model.args.low_memory = bool(args.low_memory)
