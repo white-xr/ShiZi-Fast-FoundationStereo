@@ -5,7 +5,14 @@
 #   python scripts/run_config.py --config configs/stereo_infer.yaml --dry_run
 
 model_dir: weights/15-44-51/model_best_bp2_serialize.pth
-intrinsic_file: workspace/data/data-50mm/K.txt
+
+# 只需要改这里：填写一次采集输出目录。
+# 脚本会自动使用：
+#   data_dir/K.txt
+#   data_dir/left_rgb/
+#   data_dir/right_rgb/
+data_dir: workspace/data/616-50mm/2
+intrinsic_file: auto
 
 # 数据和输出统一放在 workspace 下：
 #   workspace/data    放输入数据
@@ -14,10 +21,11 @@ intrinsic_file: workspace/data/data-50mm/K.txt
 out_dir: workspace/output
 run_dir_format: "%m%d%H%M"
 
-valid_iters: 8
-max_disp: 192
-scale: 1
-hiera: 0
+valid_iters: 24    #模型迭代更新视差的次数。越大通常越精细，但越慢。
+max_disp: 256      #最大视差搜索范围。物体越近、scale 越大，需要的最大视差越大。
+low_memory: 1      #省显存模式。1 更省显存但更慢，6GB 显卡建议打开。
+scale: 1           #推理前把左右图放大多少倍
+hiera: 0  #层级推理开关。0 是普通模式，保留细节更直接；1 是先低分辨率估计再细化，整体可能更稳，但小细节可能被平滑
 remove_invisible: 1
 
 # get_pc=1 会保存 cloud.ply 点云。
@@ -26,13 +34,13 @@ remove_invisible: 1
 #   depth_mm.png     16 位深度原图，单位 mm
 #   depth_vis.png    深度可视化图，方便无头环境查看
 get_pc: 1
-zfar: 100
+zfar: 3
 denoise_cloud: 0
 denoise_nb_points: 30
 denoise_radius: 0.03
 
 # 无头环境建议保持 0。只有本机桌面有 DISPLAY 时再改成 1。
-show: 0
+show: 1
 overwrite: true
 
 # 可选：通过 SSH/SCP 把深度和点云传到 Windows。
@@ -41,7 +49,7 @@ overwrite: true
 # 也可以只测试传输配置，不跑模型：
 #   python scripts/run_config.py --config configs/stereo_infer.yaml --check_transfer
 transfer:
-  enabled: true
+  enabled: false
 
   # 如果网络变化，替换成新的 Windows IPv4 地址。
   host: 192.168.1.95
@@ -75,20 +83,18 @@ transfer:
 # 000001,1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1
 # 矩阵含义为 T_world_camera，平移单位为 m。
 fusion:
-  enabled: true
+  enabled: false
   pose_file: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/poses.csv
   output_file: merged_cloud.ply
   voxel_size: 0.002
   missing_pose_policy: error
 
 batch:
-  left_dir: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/left_rgb
-  right_dir: workspace/data/data-50mm/真值500mm-双RGB-批头=下料机/right_rgb
   pattern: "*.png"
 
   # 默认 ids: [] 跑整个文件夹。
   # 如果只想快速测试一张，可改成 ids: ["000411"]。
-  ids: []
+  ids: ["000015"]
 
   # 批量跑整个文件夹时，可以按编号范围或数量限制。
   # start: "000100"

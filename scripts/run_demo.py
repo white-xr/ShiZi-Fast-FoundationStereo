@@ -37,6 +37,7 @@ def create_parser():
   parser.add_argument('--get_pc', type=int, default=1, help='save point cloud output')
   parser.add_argument('--valid_iters', type=int, default=8, help='number of flow-field updates during forward pass')
   parser.add_argument('--max_disp', type=int, default=192, help='maximum disparity')
+  parser.add_argument('--low_memory', type=int, default=0, help='use lower-memory correlation sampling')
   parser.add_argument('--zfar', type=float, default=100, help="max depth to include in point cloud")
   parser.add_argument('--show', type=int, default=1, help='show cv2/open3d windows when DISPLAY is available')
   return parser
@@ -64,6 +65,7 @@ def load_model(args):
   model = torch.load(args.model_dir, map_location='cpu', weights_only=False)
   model.args.valid_iters = args.valid_iters
   model.args.max_disp = args.max_disp
+  model.args.low_memory = bool(args.low_memory)
   try:
     has_normalize = 'normalize' in model.args
   except TypeError:

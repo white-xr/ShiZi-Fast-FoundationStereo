@@ -76,6 +76,54 @@ def sample_name(left_file, provided=None):
   return str(provided) if provided else Path(left_file).stem
 
 
+def is_auto_value(value):
+  return value is None or str(value).strip().lower() in {'', 'auto'}
+
+
+def get_data_dir(config):
+  value = config.get('data_dir') or config.get('dataset_dir')
+  if value:
+    return resolve_path(value)
+
+  batch = config.get('batch') or {}
+  value = batch.get('data_dir') or batch.get('dataset_dir')
+  if value:
+    return resolve_path(value)
+
+  return None
+
+
+def apply_auto_dataset_paths(config):
+  config = dict(config)
+  data_dir = get_data_dir(config)
+  if data_dir is None:
+    return config
+
+  if not data_dir.exists():
+    raise FileNotFoundError(f'找不到数据目录：{data_dir}')
+
+  intrinsic_file = config.get('intrinsic_file')
+  if is_auto_value(intrinsic_file):
+    k_file = data_dir / 'K.txt'
+    if not k_file.exists():
+      raise FileNotFoundError(f'数据目录下找不到 K.txt：{k_file}')
+    config['intrinsic_file'] = str(k_file)
+
+  batch = dict(config.get('batch') or {})
+  batch.setdefault('pattern', '*.png')
+  if is_auto_value(batch.get('left_dir')):
+    batch['left_dir'] = str(data_dir / 'left_rgb')
+  if is_auto_value(batch.get('right_dir')):
+    batch['right_dir'] = str(data_dir / 'right_rgb')
+  for key in ('left_dir', 'right_dir'):
+    path = resolve_path(batch[key])
+    if not path.exists():
+      raise FileNotFoundError(f'数据目录下找不到 {path.name}：{path}')
+  config['batch'] = batch
+
+  return config
+
+
 def collect_pairs(config):
   pairs = []
 
@@ -388,7 +436,7 @@ def transfer_outputs(sample_out_dir, remote_relative_dir, transfer):
 def main():
   args = parse_args()
   config_path = resolve_path(args.config)
-  config = load_yaml(config_path)
+  config = apply_auto_dataset_paths(load_yaml(config_path))
 
   run_demo.configure_runtime()
   if args.check_transfer:
@@ -402,6 +450,8 @@ def main():
     raise SystemExit('No stereo pairs found. Check single/batch/pairs in the config.')
 
   logging.info(f'Config: {config_path}')
+  if config.get('intrinsic_file'):
+    logging.info(f'Intrinsic: {resolve_path(config["intrinsic_file"])}')
   logging.info(f'Pairs: {len(pairs)}')
   for idx, pair in enumerate(pairs, 1):
     logging.info(f'[{idx}/{len(pairs)}] {pair["name"]}: {pair["left_file"]} | {pair["right_file"]}')
