@@ -6,7 +6,7 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-import os, sys, shutil, html
+import os, sys, shutil, html, gc, time
 from pathlib import Path
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
@@ -35,8 +35,14 @@ def create_parser():
   parser.add_argument('--scale', default=1, type=float)
   parser.add_argument('--hiera', default=0, type=int)
   parser.add_argument('--get_pc', type=int, default=1, help='save point cloud output')
+  parser.add_argument('--save_inputs', type=int, default=1, help='save resized left.png and right.png')
+  parser.add_argument('--save_disp', type=int, default=1, help='save disp.npy')
+  parser.add_argument('--save_disp_vis', type=int, default=1, help='save disp_vis.png')
+  parser.add_argument('--save_depth', type=int, default=1, help='save depth_meter.npy, depth_mm.png, depth_vis.png')
+  parser.add_argument('--save_report', type=int, default=1, help='save index.html report')
   parser.add_argument('--valid_iters', type=int, default=8, help='number of flow-field updates during forward pass')
   parser.add_argument('--max_disp', type=int, default=192, help='maximum disparity')
+  parser.add_argument('--build_volume_backend', default='pytorch1', choices=['pytorch1', 'triton'], help='cost volume build backend')
   parser.add_argument('--low_memory', type=int, default=0, help='use lower-memory correlation sampling')
   parser.add_argument('--zfar', type=float, default=100, help="max depth to include in point cloud")
   parser.add_argument('--show', type=int, default=1, help='show cv2/open3d windows when DISPLAY is available')
@@ -59,6 +65,12 @@ def configure_runtime():
   set_logging_format()
   set_seed(0)
   torch.autograd.set_grad_enabled(False)
+  cpu_threads = int(os.environ.get('FFS_CPU_THREADS', '2'))
+  torch.set_num_threads(max(1, cpu_threads))
+  try:
+    torch.set_num_interop_threads(1)
+  except RuntimeError:
+    pass
 
 
 def load_model(args):
@@ -80,6 +92,12 @@ def load_model(args):
 
   model.cuda().eval()
   return model
+
+
+def release_cuda_cache():
+  gc.collect()
+  if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 
 def read_image(path):
@@ -198,18 +216,33 @@ def maybe_show_point_cloud(pcd, args):
   vis.destroy_window()
 
 
-def run_pair(model, args, clean_out_dir=True):
-  out_dir = Path(args.out_dir)
-  if clean_out_dir and out_dir.exists():
-    shutil.rmtree(out_dir)
-  out_dir.mkdir(parents=True, exist_ok=True)
+def run_pair_arrays(
+  model,
+  args,
+  img0,
+  img1,
+  out_dir=None,
+  title='Stereo result',
+  clean_out_dir=True,
+  return_outputs=True,
+  intrinsic_matrix=None,
+  baseline_m=None,
+):
+  out_dir = Path(out_dir) if out_dir is not None else None
+  writes_output = any(bool(getattr(args, key, 0)) for key in (
+    'save_inputs', 'save_disp', 'save_disp_vis', 'save_depth', 'save_report', 'get_pc',
+  ))
+  if writes_output and out_dir is None:
+    raise ValueError('out_dir is required when an output save flag is enabled')
+  if out_dir is not None and writes_output:
+    if clean_out_dir and out_dir.exists():
+      shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-  logging.info(f"args:\n{args}")
+  logging.debug(f"args:\n{args}")
+  started = time.perf_counter()
 
   scale = args.scale
-
-  img0 = read_image(args.left_file)
-  img1 = read_image(args.right_file)
 
   img0 = cv2.resize(img0, fx=scale, fy=scale, dsize=None)
   img1 = cv2.resize(img1, dsize=(img0.shape[1], img0.shape[0]))
@@ -217,32 +250,49 @@ def run_pair(model, args, clean_out_dir=True):
   img0_ori = img0.copy()
   img1_ori = img1.copy()
   logging.info(f"img0: {img0.shape}")
-  imageio.imwrite(out_dir / 'left.png', img0)
-  imageio.imwrite(out_dir / 'right.png', img1)
+  if args.save_inputs:
+    imageio.imwrite(out_dir / 'left.png', img0)
+    imageio.imwrite(out_dir / 'right.png', img1)
 
   img0 = torch.as_tensor(img0).cuda().float()[None].permute(0,3,1,2)
   img1 = torch.as_tensor(img1).cuda().float()[None].permute(0,3,1,2)
   padder = InputPadder(img0.shape, divis_by=32, force_square=False)
   img0, img1 = padder.pad(img0, img1)
+  preprocess_ms = (time.perf_counter() - started) * 1000.0
 
   logging.info(f"Start forward, 1st time run can be slow due to compilation")
+  if torch.cuda.is_available():
+    torch.cuda.synchronize()
+  forward_started = time.perf_counter()
   with torch.amp.autocast('cuda', enabled=True, dtype=AMP_DTYPE):
     if not args.hiera:
-      disp = model.forward(img0, img1, iters=args.valid_iters, test_mode=True, optimize_build_volume='pytorch1')
+      disp = model.forward(
+        img0,
+        img1,
+        iters=args.valid_iters,
+        test_mode=True,
+        optimize_build_volume=args.build_volume_backend,
+      )
     else:
       disp = model.run_hierachical(img0, img1, iters=args.valid_iters, test_mode=True, small_ratio=0.5)
+  if torch.cuda.is_available():
+    torch.cuda.synchronize()
+  ffs_ms = (time.perf_counter() - forward_started) * 1000.0
   logging.info("forward done")
   disp = padder.unpad(disp.float())
   disp = disp.data.cpu().numpy().reshape(H,W).clip(0, None)
-  np.save(out_dir / 'disp.npy', disp)
+  if args.save_disp:
+    np.save(out_dir / 'disp.npy', disp)
 
-  cmap = None
-  min_val = None
-  max_val = None
-  vis = vis_disparity(disp, min_val=min_val, max_val=max_val, cmap=cmap, color_map=cv2.COLORMAP_TURBO)
-  vis = np.concatenate([img0_ori, img1_ori, vis], axis=1)
-  imageio.imwrite(out_dir / 'disp_vis.png', vis)
-  maybe_show_disparity(vis, args)
+  if args.save_disp_vis or args.show:
+    cmap = None
+    min_val = None
+    max_val = None
+    vis = vis_disparity(disp, min_val=min_val, max_val=max_val, cmap=cmap, color_map=cv2.COLORMAP_TURBO)
+    vis = np.concatenate([img0_ori, img1_ori, vis], axis=1)
+    if args.save_disp_vis:
+      imageio.imwrite(out_dir / 'disp_vis.png', vis)
+    maybe_show_disparity(vis, args)
 
   disp_for_depth = disp.copy()
   if args.remove_invisible:
@@ -253,44 +303,92 @@ def run_pair(model, args, clean_out_dir=True):
 
   depth = None
   K = None
-  if args.intrinsic_file:
+  xyz_map = None
+  if intrinsic_matrix is not None:
+    K = np.asarray(intrinsic_matrix, dtype=np.float32).reshape(3, 3).copy()
+    if baseline_m is None:
+      raise ValueError('baseline_m is required with intrinsic_matrix')
+    baseline = float(baseline_m)
+  elif args.intrinsic_file:
     with open(args.intrinsic_file, 'r') as f:
       lines = f.readlines()
       K = np.array(list(map(float, lines[0].rstrip().split()))).astype(np.float32).reshape(3,3)
       baseline = float(lines[1])
+  else:
+    baseline = None
+  if K is not None:
     K[:2] *= scale
+    crop_origin_xy = getattr(args, 'crop_origin_xy', None)
+    if crop_origin_xy is not None:
+      K[0, 2] -= float(crop_origin_xy[0]) * scale
+      K[1, 2] -= float(crop_origin_xy[1]) * scale
     depth = np.zeros_like(disp_for_depth, dtype=np.float32)
     valid_disp = np.isfinite(disp_for_depth) & (disp_for_depth > 1e-6)
     depth[valid_disp] = K[0,0] * baseline / disp_for_depth[valid_disp]
-    save_depth_outputs(depth, out_dir, args.zfar)
+    if args.save_depth:
+      save_depth_outputs(depth, out_dir, args.zfar)
+    xyz_map = depth2xyzmap(depth, K)
 
+  pcd = None
   if args.get_pc:
     if depth is None or K is None:
       logging.info("No intrinsic_file, skipping point cloud output")
-      write_html_report(out_dir, title=Path(args.left_file).stem)
-      return
-    if o3d is None:
+    elif o3d is None:
       logging.info("open3d is not installed, skipping point cloud output")
-      write_html_report(out_dir, title=Path(args.left_file).stem)
-      return
-    xyz_map = depth2xyzmap(depth, K)
-    pcd = toOpen3dCloud(xyz_map.reshape(-1,3), img0_ori.reshape(-1,3))
-    keep_mask = (np.asarray(pcd.points)[:,2]>0) & (np.asarray(pcd.points)[:,2]<=args.zfar)
-    keep_ids = np.arange(len(np.asarray(pcd.points)))[keep_mask]
-    pcd = pcd.select_by_index(keep_ids)
-    o3d.io.write_point_cloud(str(out_dir / 'cloud.ply'), pcd)
-    logging.info(f"PCL saved to {out_dir}")
+    else:
+      pcd = toOpen3dCloud(xyz_map.reshape(-1,3), img0_ori.reshape(-1,3))
+      keep_mask = (np.asarray(pcd.points)[:,2]>0) & (np.asarray(pcd.points)[:,2]<=args.zfar)
+      keep_ids = np.arange(len(np.asarray(pcd.points)))[keep_mask]
+      pcd = pcd.select_by_index(keep_ids)
+      o3d.io.write_point_cloud(str(out_dir / 'cloud.ply'), pcd)
+      logging.info(f"PCL saved to {out_dir}")
 
-    if args.denoise_cloud:
-      logging.info("[Optional step] denoise point cloud...")
-      pcd = pcd.voxel_down_sample(voxel_size=0.001)
-      cl, ind = pcd.remove_radius_outlier(nb_points=args.denoise_nb_points, radius=args.denoise_radius)
-      inlier_cloud = pcd.select_by_index(ind)
-      o3d.io.write_point_cloud(str(out_dir / 'cloud_denoise.ply'), inlier_cloud)
-      pcd = inlier_cloud
+      if args.denoise_cloud:
+        logging.info("[Optional step] denoise point cloud...")
+        pcd = pcd.voxel_down_sample(voxel_size=0.001)
+        cl, ind = pcd.remove_radius_outlier(nb_points=args.denoise_nb_points, radius=args.denoise_radius)
+        inlier_cloud = pcd.select_by_index(ind)
+        o3d.io.write_point_cloud(str(out_dir / 'cloud_denoise.ply'), inlier_cloud)
+        pcd = inlier_cloud
 
-    maybe_show_point_cloud(pcd, args)
-  write_html_report(out_dir, title=Path(args.left_file).stem)
+      maybe_show_point_cloud(pcd, args)
+  if args.save_report:
+    write_html_report(out_dir, title=title)
+  valid_disparity = np.isfinite(disp_for_depth) & (disp_for_depth > 1e-6)
+  return {
+    'pcd': pcd,
+    'disp': disp,
+    'depth': depth,
+    'K': K,
+    'baseline_m': baseline,
+    'xyz_map': xyz_map,
+    'left_rgb': img0_ori,
+    'right_rgb': img1_ori,
+    'scale': scale,
+    'valid_disparity_mask': valid_disparity,
+    'valid_disparity_ratio': float(np.count_nonzero(valid_disparity) / valid_disparity.size),
+    'timings_ms': {
+      'preprocess_ms': preprocess_ms,
+      'ffs_ms': ffs_ms,
+      'postprocess_ms': (time.perf_counter() - forward_started) * 1000.0 - ffs_ms,
+      'total_ms': (time.perf_counter() - started) * 1000.0,
+    },
+  }
+
+
+def run_pair(model, args, clean_out_dir=True, return_outputs=False):
+  img0 = read_image(args.left_file)
+  img1 = read_image(args.right_file)
+  return run_pair_arrays(
+    model,
+    args,
+    img0,
+    img1,
+    args.out_dir,
+    title=Path(args.left_file).stem,
+    clean_out_dir=clean_out_dir,
+    return_outputs=return_outputs,
+  )
 
 
 def main(argv=None):

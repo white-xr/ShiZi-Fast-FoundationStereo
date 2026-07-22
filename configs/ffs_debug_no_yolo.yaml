@@ -1,0 +1,39 @@
+input_mode: image
+locator:
+  enabled: false
+model_dir: weights/23-36-37/model_best_bp2_serialize.pth
+intrinsic_file: auto
+valid_iters: 2
+max_disp: 96
+build_volume_backend: pytorch1
+low_memory: 1
+scale: 1
+hiera: 0
+remove_invisible: 1
+save_inputs: 0
+save_disp: 1
+save_disp_vis: 1
+save_depth: 1
+save_report: 0
+get_pc: 1
+zfar: 0.8
+show: 0
+overwrite: true
+segmentation:
+  enabled: false
+safety:
+  enabled: true
+  action: error
+  max_scale: 1.0
+  max_valid_iters: 2
+  max_max_disp: 96
+  require_low_memory_when_vram_gb_lte: 6.5
+  min_free_vram_gb: 1.0
+  require_healthy_gpu: true
+data_dir: workspace/data/A相机→白板268
+out_dir: workspace/output/ffs_debug_no_yolo
+run_dir_format: "%m%d%H%M"
+append_data_name_to_run_dir: true
+batch:
+  pattern: "*.png"
+  ids: ["000011"]

@@ -1,0 +1,13 @@
+# Replace these placeholders by running scripts/export_orbbec_stereo_calib.py
+# or scripts/calibrate_stereo.py. Values must describe the dual RGB streams.
+configured: false
+source: null
+image_width: 1280
+image_height: 800
+K1: null
+D1: null
+K2: null
+D2: null
+R: null
+T: null
+baseline_m: null

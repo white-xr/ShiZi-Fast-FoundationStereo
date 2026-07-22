@@ -1,5 +1,6 @@
 __pycache__/
 **/__pycache__/
+.pytest_cache/
 *.vscode
 cfg.yaml
 *.pth
@@ -16,3 +17,5 @@ workespace/
 data-50mm/
 .claude/
 cpp/build/
+build/
+Log/

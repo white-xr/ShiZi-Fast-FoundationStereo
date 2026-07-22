@@ -1,0 +1,5 @@
+# Set configured=true only after measuring CAD coordinates or running robust
+# multi-view reprojection calibration. Plate coordinates and values use meters.
+configured: false
+source: null
+offset_m: [null, null, null]
