@@ -46,11 +46,11 @@ remove_invisible: 1
 # =============================================================================
 
 # 结果保存开关。当前设置表示：只保存 YOLO mask 和两个裁剪点云。
-save_inputs: 0
-save_disp: 0
+save_inputs: 1
+save_disp: 1
 save_disp_vis: 0
 save_depth: 1
-save_report: 0
+save_report: 1
 
 # 整张图点云输出开关。这里关闭 cloud.ply，只保留 segmentation 裁出来的两个点云。
 get_pc: 1
@@ -145,7 +145,7 @@ safety:
 #   data_dir/K.txt
 #   data_dir/left_rgb/
 #   data_dir/right_rgb/
-data_dir: workspace/data/A相机→白板268
+data_dir: workspace/data/白板361三角324
 
 # 本地图片流的输出根目录。每次运行会在这里新建一个子目录。
 out_dir: workspace/output/取料器真值

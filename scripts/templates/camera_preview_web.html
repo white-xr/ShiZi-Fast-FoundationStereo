@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gemini 305 Dual RGB</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, "Microsoft YaHei", system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: #0d1317; color: #edf2f4; }
+    header { height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 0 18px; background: #182127; border-bottom: 1px solid #344149; }
+    h1 { margin: 0; font-size: 17px; letter-spacing: 0; }
+    #status { color: #a9c7be; font-size: 13px; font-variant-numeric: tabular-nums; }
+    main { min-height: calc(100vh - 54px); display: grid; grid-template-columns: minmax(0, 1fr) 330px; overflow: hidden; }
+    .viewer { min-width: 0; display: flex; flex-direction: column; justify-content: center; padding: 12px; overflow: auto; }
+    .labels { display: grid; grid-template-columns: 1fr 1fr; color: #c9d2d7; font-size: 13px; text-align: center; background: #20292f; border: 1px solid #3a454c; border-bottom: 0; }
+    .labels span { padding: 7px; }
+    .labels span + span { border-left: 1px solid #3a454c; }
+    img { display: block; width: 100%; height: auto; background: #050708; border: 1px solid #3a454c; }
+    aside { background: #f7f9fa; color: #20282e; border-left: 1px solid #3a454c; overflow-y: auto; }
+    section { padding: 14px 16px; border-bottom: 1px solid #d7dde1; }
+    h2 { margin: 0 0 10px; font-size: 14px; letter-spacing: 0; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { padding: 7px 4px; border-bottom: 1px solid #e0e5e8; text-align: right; font-size: 12px; }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: #68757d; }
+    .metrics { display: grid; grid-template-columns: 1fr auto; gap: 8px 12px; font-size: 13px; }
+    .metrics span:nth-child(odd) { color: #65727a; }
+    .metrics span:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
+    .badge { display: inline-block; padding: 5px 8px; border-radius: 3px; color: #fff; background: #a33d3d; font-size: 12px; }
+    .badge.valid { background: #17775e; }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; overflow: visible; }
+      aside { border-left: 0; border-top: 1px solid #3a454c; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Gemini 305 Dual RGB</h1>
+    <div id="status">正在连接...</div>
+  </header>
+  <main>
+    <div class="viewer">
+      <div class="labels"><span>左 RGB + YOLO / A/B/C</span><span>同步右 RGB</span></div>
+      <img id="stream" alt="Gemini 305 实时三角板定位">
+    </div>
+    <aside>
+      <section>
+        <h2>当前结果</h2>
+        <span class="badge" id="resultBadge">等待推理</span>
+      </section>
+      <section>
+        <h2>A/B/C 左 RGB 像素与深度</h2>
+        <table>
+          <thead><tr><th>点位</th><th>u</th><th>v</th><th>mm</th></tr></thead>
+          <tbody id="vertexRows"></tbody>
+        </table>
+      </section>
+      <section>
+        <h2>运行状态</h2>
+        <div class="metrics" id="runtimeMetrics"></div>
+      </section>
+    </aside>
+  </main>
+  <script>
+    const stream = document.getElementById('stream');
+    const status = document.getElementById('status');
+    const resultBadge = document.getElementById('resultBadge');
+    const vertexRows = document.getElementById('vertexRows');
+    const runtimeMetrics = document.getElementById('runtimeMetrics');
+    let lastFrame = -1;
+
+    function format(value, digits = 2) {
+      return value === null || value === undefined || !Number.isFinite(Number(value))
+        ? '—'
+        : Number(value).toFixed(digits);
+    }
+
+    function renderState(state) {
+      const vertices = state.vertices_raw_uv;
+      const camera = state.vertices_camera_mm;
+      vertexRows.innerHTML = ['A', 'B', 'C'].map((name, index) => {
+        const pixel = vertices && vertices[index];
+        const xyz = camera && camera[index];
+        return `<tr><td>${name}</td><td>${pixel ? format(pixel[0]) : '—'}</td><td>${pixel ? format(pixel[1]) : '—'}</td><td>${xyz ? format(xyz[2]) : '—'}</td></tr>`;
+      }).join('');
+      resultBadge.textContent = state.plate_valid
+        ? `${state.pose_source} | 质量 ${format(state.quality_score, 3)}`
+        : state.invalid_reason || '姿态无效';
+      resultBadge.className = `badge${state.plate_valid ? ' valid' : ''}`;
+      const timing = state.timings_ms || {};
+      const rows = [
+        ['采集帧', state.captured],
+        ['处理帧', state.processed],
+        ['丢弃旧帧', state.dropped],
+        ['总耗时 / ms', format(timing.total_ms, 1)],
+        ['YOLO / ms', format(timing.yolo_ms, 1)],
+        ['FFS / ms', format(timing.ffs_ms, 1)],
+      ];
+      runtimeMetrics.innerHTML = rows.map(([label, value]) => `<span>${label}</span><span>${value ?? '—'}</span>`).join('');
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch('/api/state', {cache: 'no-store'});
+        const state = await response.json();
+        if (state.display_frame_id !== lastFrame) {
+          lastFrame = state.display_frame_id;
+          stream.src = `/api/frame.jpg?t=${Date.now()}`;
+        }
+        renderState(state);
+        status.textContent = `${state.width}×${state.height} | 推理帧 ${state.display_frame_id} | 左/右时间差 ${state.timestamp_delta_ms.toFixed(3)} ms`;
+      } catch (error) {
+        status.textContent = `连接失败：${error.message}`;
+      }
+    }
+    setInterval(refresh, 250);
+    refresh();
+  </script>
+</body>
+</html>

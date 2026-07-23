@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import cv2
 import numpy as np
 import pytest
@@ -92,6 +94,32 @@ def test_sdk_profiles_preserve_left_to_right_translation_and_opencv_distortion_o
     calibration.D1,
     [-1.2, 0.8, -0.0001, 0.0002, -0.2, 0.01, 0.02, 0.03],
   )
+
+
+def test_sdk_profiles_reject_non_horizontal_dual_rgb_translation():
+  intrinsic = SimpleNamespace(
+    width=1280, height=800, fx=613.5, fy=613.3, cx=632.0, cy=398.1,
+  )
+  distortion = SimpleNamespace(
+    k1=0.0, k2=0.0, k3=0.0, k4=0.0, k5=0.0, k6=0.0, p1=0.0, p2=0.0,
+  )
+  extrinsic = SimpleNamespace(
+    rot=np.eye(3, dtype=np.float32),
+    transform=np.array([-18.018206, -18.018206, -18.018206], dtype=np.float32),
+  )
+
+  class Profile:
+    def get_intrinsic(self):
+      return intrinsic
+
+    def get_distortion(self):
+      return distortion
+
+    def get_extrinsic_to(self, _other):
+      return extrinsic
+
+  with pytest.raises(CalibrationError, match='predominantly horizontal'):
+    stereo_calibration_from_sdk_profiles(Profile(), Profile())
 
 
 def test_rectified_left_pixels_map_back_to_raw_left_pixels():

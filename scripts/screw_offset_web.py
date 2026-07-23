@@ -25,8 +25,6 @@ from triangle_locator.pipeline import TriangleLocator
 
 VERTEX_NAMES = ('A / base-left', 'B / base-right', 'C / tip')
 VERTEX_COLORS = ((40, 190, 255), (255, 170, 40), (220, 80, 220))
-AXIS_NAMES = ('X', 'Y', 'Z')
-AXIS_COLORS = ((30, 30, 235), (45, 190, 45), (225, 95, 30))
 
 
 def parse_args(argv=None):
@@ -59,6 +57,9 @@ def _empty_frame_state(name):
     'name': name,
     'inferred': False,
     'plate_valid': False,
+    'pose_source': 'INVALID',
+    'pose_confidence': 0.0,
+    'temporal_age': 0,
     'invalid_reason': '',
     'quality_score': 0.0,
     'plane_rmse_px': None,
@@ -68,8 +69,13 @@ def _empty_frame_state(name):
     'rectification': None,
     'vertices_camera_mm': None,
     'vertices_rect_uv': None,
+    'vertices_raw_uv': None,
+    'candidate_vertices_rect_uv': None,
     'origin_camera_mm': None,
+    'origin_raw_uv': None,
     'rotation_camera': None,
+    'triangle_metrics': None,
+    'tracking': None,
   }
 
 
@@ -204,7 +210,7 @@ class PoseWebSession:
         self.rectified_cache.clear()
         if self.locator is not None:
           self.locator.config = config
-          self.locator.previous_rotation = None
+          self.locator.reset_tracking()
     finally:
       self.inference_lock.release()
     return self.public_state()
@@ -231,7 +237,6 @@ class PoseWebSession:
         'right_bgr': right,
         **metadata,
       }
-      self.locator.previous_rotation = None
       result = self.locator.process(frame, output_dir=None, debug=False)
       with self.lock:
         self.records[name] = result
@@ -256,10 +261,23 @@ class PoseWebSession:
       return _empty_frame_state(name)
     vertices_xyz = result.get('plate_vertices_camera_m')
     origin = result.get('plate_origin_camera_m')
+    rotation = result.get('plate_rotation_camera')
+    vertices_rect_uv = result.get('plate_vertices_left_uv')
+    vertices_raw_uv = None
+    if vertices_rect_uv is not None:
+      vertices_raw_uv = self.rectifier.left_rectified_to_raw(vertices_rect_uv)
+    origin_raw_uv = None
+    if origin is not None:
+      origin_rect_uv = _project(self.rectifier.K, origin)
+      if origin_rect_uv is not None:
+        origin_raw_uv = self.rectifier.left_rectified_to_raw([origin_rect_uv])[0]
     return {
       'name': name,
       'inferred': True,
       'plate_valid': bool(result.get('plate_valid')),
+      'pose_source': result.get('pose_source') or 'INVALID',
+      'pose_confidence': float(result.get('pose_confidence') or 0.0),
+      'temporal_age': int(result.get('temporal_age') or 0),
       'invalid_reason': result.get('invalid_reason') or '',
       'quality_score': float(result.get('quality_score') or 0.0),
       'plane_rmse_px': result.get('plane_rmse_px'),
@@ -268,9 +286,14 @@ class PoseWebSession:
       'spatial_coverage': float(result.get('spatial_coverage') or 0.0),
       'rectification': result.get('rectification'),
       'vertices_camera_mm': (np.asarray(vertices_xyz) * 1000.0).tolist() if vertices_xyz is not None else None,
-      'vertices_rect_uv': result.get('plate_vertices_left_uv'),
+      'vertices_rect_uv': vertices_rect_uv,
+      'vertices_raw_uv': vertices_raw_uv.tolist() if vertices_raw_uv is not None else None,
+      'candidate_vertices_rect_uv': result.get('candidate_vertices_left_uv'),
       'origin_camera_mm': (np.asarray(origin) * 1000.0).tolist() if origin is not None else None,
-      'rotation_camera': result.get('plate_rotation_camera'),
+      'origin_raw_uv': origin_raw_uv.tolist() if origin_raw_uv is not None else None,
+      'rotation_camera': rotation,
+      'triangle_metrics': result.get('triangle_metrics'),
+      'tracking': result.get('tracking'),
     }
 
   def public_state(self):
@@ -293,17 +316,39 @@ class PoseWebSession:
     raw_display = view == 'raw_pose'
     image = raw if raw_display else rectified
     result = self.records.get(name)
+    if result is not None:
+      candidate_rect = result.get('candidate_vertices_left_uv')
+      show_candidate = candidate_rect is not None and (
+        not result.get('plate_valid') or result.get('pose_source') == 'TEMPORAL'
+      )
+      if show_candidate:
+        candidate_rect = np.asarray(candidate_rect, dtype=np.float64)
+        candidate = (
+          self.rectifier.left_rectified_to_raw(candidate_rect)
+          if raw_display else candidate_rect
+        )
+        cv2.polylines(
+          image,
+          [np.round(candidate).astype(np.int32)],
+          True,
+          (60, 60, 225),
+          2,
+          cv2.LINE_AA,
+        )
+        _draw_label(image, 'MASK CANDIDATE', candidate[0], (60, 60, 225))
     if result is not None and result.get('plate_valid'):
+      pose_source = result.get('pose_source') or 'DIRECT'
+      outline_color = (40, 175, 255) if pose_source == 'TEMPORAL' else (60, 220, 90)
       vertices_rect = np.asarray(result['plate_vertices_left_uv'], dtype=np.float64)
       vertices = self.rectifier.left_rectified_to_raw(vertices_rect) if raw_display else vertices_rect
-      cv2.polylines(image, [np.round(vertices).astype(np.int32)], True, (60, 220, 90), 3, cv2.LINE_AA)
+      cv2.polylines(image, [np.round(vertices).astype(np.int32)], True, outline_color, 3, cv2.LINE_AA)
       for index, (point, color) in enumerate(zip(vertices, VERTEX_COLORS)):
         center = tuple(np.round(point).astype(int))
         cv2.circle(image, center, 7, color, -1, cv2.LINE_AA)
         cv2.circle(image, center, 10, (20, 24, 28), 2, cv2.LINE_AA)
         _draw_label(image, VERTEX_NAMES[index].split(' ')[0], point, color)
+      _draw_label(image, pose_source, vertices[0] + np.array([0.0, -18.0]), outline_color)
 
-      rotation = np.asarray(result['plate_rotation_camera'], dtype=np.float64)
       origin_xyz = np.asarray(result['plate_origin_camera_m'], dtype=np.float64)
       origin_rect_uv = _project(self.rectifier.K, origin_xyz)
       if origin_rect_uv is not None:
@@ -314,27 +359,6 @@ class PoseWebSession:
         origin_point = tuple(np.round(origin_uv).astype(int))
         cv2.drawMarker(image, origin_point, (0, 220, 255), cv2.MARKER_CROSS, 18, 3, cv2.LINE_AA)
         _draw_label(image, 'O', origin_uv, (0, 220, 255))
-        for axis_index, (axis_name, color) in enumerate(zip(AXIS_NAMES, AXIS_COLORS)):
-          endpoint_rect = _project(
-            self.rectifier.K,
-            origin_xyz + rotation[:, axis_index] * self.axis_length_m,
-          )
-          if endpoint_rect is None:
-            continue
-          endpoint = (
-            self.rectifier.left_rectified_to_raw([endpoint_rect])[0]
-            if raw_display else endpoint_rect
-          )
-          cv2.arrowedLine(
-            image,
-            origin_point,
-            tuple(np.round(endpoint).astype(int)),
-            color,
-            3,
-            cv2.LINE_AA,
-            tipLength=0.18,
-          )
-          _draw_label(image, axis_name, endpoint, color)
     ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 94])
     if not ok:
       raise RuntimeError('图像编码失败')

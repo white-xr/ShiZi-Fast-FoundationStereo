@@ -1,14 +1,17 @@
 # === Model & inference ===
-timm
-einops
-omegaconf
-scipy
-numpy
-scikit-image
-opencv-contrib-python
-imageio
-pyyaml
-open3d
+# Install the CUDA PyTorch build first; see triangle_locator/README.md.
+timm>=1.0,<2
+einops>=0.8,<1
+omegaconf>=2.3,<3
+scipy>=1.14,<2
+numpy>=2.0,<3
+scikit-image>=0.24,<0.27
+opencv-contrib-python>=4.10,<5
+imageio>=2.34,<3
+pyyaml>=6,<7
+open3d>=0.19,<0.20
+ultralytics>=8.3,<9
+flask>=3.1,<4
 
 # === TensorRT (optional — uncomment if needed) ===
 # onnx

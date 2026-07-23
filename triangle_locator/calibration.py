@@ -116,6 +116,12 @@ def stereo_calibration_from_sdk_profiles(left_profile, right_profile, source='Or
   baseline = float(np.linalg.norm(translation))
   if not 0.001 <= baseline <= 1.0:
     raise CalibrationError(f'Orbbec SDK returned an implausible stereo baseline: {baseline} m')
+  lateral_translation = float(np.linalg.norm(translation[1:]))
+  if abs(float(translation[0])) < 1e-6 or lateral_translation > max(0.002, abs(float(translation[0])) * 0.25):
+    raise CalibrationError(
+      'Orbbec SDK returned an implausible Dual RGB translation; '
+      f'expected a predominantly horizontal baseline, got {translation.tolist()} m'
+    )
 
   return StereoCalibration(
     image_width=int(left_intrinsic.width),

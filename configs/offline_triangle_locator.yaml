@@ -82,6 +82,13 @@ plane:
   min_spatial_coverage: 0.55
   max_rmse_px: 1.0
 pose:
+  # YOLO mask describes the metal plate's outer support silhouette, while A/B/C
+  # are the physical inner landmarks used by the locator.  Rows map support
+  # [A, B, C] to semantic A, B and C; calibrated from raw-left annotations.
+  semantic_vertex_weights:
+    - [0.74491902, 0.13361036, 0.12147062]
+    - [0.08947715, 0.77073700, 0.13978585]
+    - [0.10800542, 0.14184271, 0.75015187]
   min_contour_area_px: 500
   min_contour_iou: 0.45
   # 电批遮挡时，同一个 YOLO 实例会由左右两个可见区域组成。
@@ -92,7 +99,51 @@ pose:
   min_visible_fraction: 0.25
   min_mask_containment: 0.85
   max_fit_error_px: 6.0
+  # 物理安装约束：A/B 是上方底边，C 必须是画面中向下的尖端。
+  min_tip_height_ratio: 0.20
+  max_tip_height_ratio: 1.60
+  max_tip_side_ratio: 0.60
+  min_tip_below_px: 1.0
+  min_base_length_px: 12.0
   min_previous_normal_dot: 0.0
+  temporal:
+    enabled: true
+    # TEMPORAL 每帧都从最后一个可靠 DIRECT 锚点跟踪到当前图，不冻结旧像素。
+    # 45 帧约为 30 FPS 下 1.5 秒；超时后拒绝输出，避免长期沿用失效锚点。
+    max_estimated_frames: 45
+    max_frame_gap: 60
+    max_interval_ms: 2000.0
+    anchor_use_target_mask: false
+    feature_padding_px: 28
+    mask_feature_padding_px: 4
+    max_features: 120
+    feature_quality: 0.01
+    feature_min_distance_px: 5.0
+    feature_block_size: 7
+    lk_window_px: 31
+    lk_max_level: 4
+    lk_iterations: 30
+    lk_epsilon: 0.01
+    max_fb_error_px: 1.5
+    min_tracked_points: 8
+    ransac_threshold_px: 2.0
+    ransac_iterations: 500
+    ransac_confidence: 0.99
+    ransac_refine_iterations: 10
+    min_inlier_points: 6
+    min_inlier_ratio: 0.50
+    min_scale: 0.65
+    max_scale: 1.55
+    max_rotation_deg: 35.0
+    max_direct_prediction_error_ratio: 0.05
+    min_direct_visible_fraction: 0.75
+    min_direct_mask_area_ratio: 0.75
+    min_candidate_visible_fraction: 0.25
+    min_candidate_mask_containment: 0.70
+    min_candidate_score: 0.15
+    min_candidate_score_margin: 0.08
+    max_vertex_outside_roi_px: 2.0
+    confidence_scale: 0.60
 visualization:
   axis_length_m: 0.03
 screw:

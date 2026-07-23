@@ -2,7 +2,12 @@ import cv2
 import numpy as np
 import pytest
 
-from triangle_locator.stereo_plane import erode_mask, fit_disparity_plane, intersect_pixels_with_disparity_plane
+from triangle_locator.stereo_plane import (
+  erode_mask,
+  fit_disparity_plane,
+  intersect_pixels_with_disparity_plane,
+  triangulate_pixels_with_disparity,
+)
 
 
 def synthetic_plane(seed=4):
@@ -82,3 +87,33 @@ def test_pixel_rays_intersect_fitted_disparity_plane():
   projected_u = K[0, 0] * points[:, 0] / points[:, 2] + K[0, 2]
   projected_v = K[1, 1] * points[:, 1] / points[:, 2] + K[1, 2]
   np.testing.assert_allclose(np.column_stack((projected_u, projected_v)), pixels)
+
+
+def test_raw_stereo_triangulation_accounts_for_different_principal_points():
+  focal = 600.0
+  baseline = 0.018
+  depth = 0.324
+  K1 = np.array([[focal, 0.0, 315.0], [0.0, focal, 240.0], [0.0, 0.0, 1.0]])
+  K2 = np.array([[focal, 0.0, 320.0], [0.0, focal, 240.0], [0.0, 0.0, 1.0]])
+  geometry = {
+    'K1': K1,
+    'K2': K2,
+    'R': np.eye(3),
+    'T': np.array([-baseline, 0.0, 0.0]),
+  }
+  pixels = np.array([[280.0, 210.0], [350.0, 215.0], [315.0, 285.0]])
+  disparity = np.full(len(pixels), focal * baseline / depth + K1[0, 2] - K2[0, 2])
+  raw_points = triangulate_pixels_with_disparity(pixels, disparity, geometry)
+  np.testing.assert_allclose(raw_points[:, 2], depth, atol=1e-9)
+
+  coefficients = np.array([0.0, 0.0, disparity[0]])
+  plane_points = intersect_pixels_with_disparity_plane(
+    pixels,
+    coefficients,
+    K1,
+    baseline,
+    stereo_geometry=geometry,
+  )
+  np.testing.assert_allclose(plane_points[:, 2], depth, atol=1e-9)
+  legacy_points = intersect_pixels_with_disparity_plane(pixels, coefficients, K1, baseline)
+  assert np.all(legacy_points[:, 2] > depth + 0.04)

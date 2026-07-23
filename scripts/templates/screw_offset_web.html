@@ -133,6 +133,7 @@
     #statusText { overflow-wrap: anywhere; }
     .badge { white-space: nowrap; padding: 4px 7px; border-radius: 3px; background: #45545d; font-size: 12px; }
     .badge.valid { background: #17775e; }
+    .badge.temporal { background: #a56712; }
     .badge.invalid { background: #a33d3d; }
     .busy {
       position: absolute;
@@ -152,12 +153,6 @@
     }
     .panel { padding: 14px 16px; border-bottom: 1px solid #d9dee2; }
     h2 { margin: 0 0 10px; font-size: 14px; font-weight: 700; letter-spacing: 0; }
-    .axis-legend { display: flex; flex-wrap: wrap; gap: 12px; color: #59666e; font-size: 12px; }
-    .swatch { width: 10px; height: 10px; display: inline-block; margin-right: 5px; }
-    .x { background: #eb3333; }
-    .y { background: #35be35; }
-    .z { background: #1e66e1; }
-    .o { background: #e0c500; }
     table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
     th, td { padding: 6px 5px; border-bottom: 1px solid #e3e7e9; text-align: right; font-size: 12px; }
     th:first-child, td:first-child { text-align: left; }
@@ -219,31 +214,16 @@
 
     <aside>
       <section class="panel">
-        <h2>局部坐标系</h2>
-        <div class="axis-legend">
-          <span><i class="swatch x"></i>X：A → B</span>
-          <span><i class="swatch y"></i>Y：底边中点 → C</span>
-          <span><i class="swatch z"></i>Z：X × Y</span>
-          <span><i class="swatch o"></i>O：三顶点均值</span>
-        </div>
-      </section>
-
-      <section class="panel">
-        <h2>三维顶点，相机坐标 mm</h2>
+        <h2>A/B/C 左 RGB 像素与相机深度</h2>
         <table>
-          <thead><tr><th>顶点</th><th>X</th><th>Y</th><th>Z</th></tr></thead>
+          <thead><tr><th>点位</th><th>u / px</th><th>v / px</th><th>深度 / mm</th></tr></thead>
           <tbody id="vertexRows"></tbody>
         </table>
       </section>
 
       <section class="panel">
-        <h2>局部原点，相机坐标 mm</h2>
+        <h2>三角板中心 O</h2>
         <table><tbody id="originRows"></tbody></table>
-      </section>
-
-      <section class="panel">
-        <h2>旋转矩阵 R（局部 → 相机）</h2>
-        <table class="matrix"><tbody id="rotationRows"></tbody></table>
       </section>
 
       <section class="panel">
@@ -308,31 +288,49 @@
     function renderFrame(frame) {
       appState.frame = frame;
       const valid = Boolean(frame.plate_valid);
-      validBadge.textContent = !frame.inferred ? '未运行' : valid ? '姿态有效' : '姿态无效';
-      validBadge.className = `badge ${!frame.inferred ? '' : valid ? 'valid' : 'invalid'}`;
+      const temporal = valid && frame.pose_source === 'TEMPORAL';
+      validBadge.textContent = !frame.inferred
+        ? '未运行'
+        : temporal
+          ? `连续估计 ${frame.temporal_age}`
+          : valid ? '直接结果' : '姿态无效';
+      validBadge.className = `badge ${!frame.inferred ? '' : temporal ? 'temporal' : valid ? 'valid' : 'invalid'}`;
       statusText.textContent = !frame.inferred
         ? '当前图像尚未恢复姿态'
         : valid
-          ? `三维姿态恢复完成，质量 ${format(frame.quality_score)}`
+          ? temporal
+            ? `遮挡连续估计，使用当前画面与当前 FFS 平面，质量 ${format(frame.pose_confidence)}`
+            : `当前 mask 直接恢复完成，质量 ${format(frame.pose_confidence)}`
           : `三维姿态无效：${frame.invalid_reason || 'UNKNOWN'}`;
 
-      const vertices = frame.vertices_camera_mm;
-      document.getElementById('vertexRows').innerHTML = vertices
-        ? vertices.map((point, index) => `<tr><td>${['A','B','C'][index]}</td><td>${format(point[0])}</td><td>${format(point[1])}</td><td>${format(point[2])}</td></tr>`).join('')
+      const vertexPixels = frame.vertices_raw_uv;
+      const vertexCamera = frame.vertices_camera_mm;
+      document.getElementById('vertexRows').innerHTML = vertexPixels && vertexCamera
+        ? vertexPixels.map((pixel, index) => `<tr><td>${['A','B','C'][index]}</td><td>${format(pixel[0])}</td><td>${format(pixel[1])}</td><td>${format(vertexCamera[index][2])}</td></tr>`).join('')
         : emptyRows(3, 4);
 
       const origin = frame.origin_camera_mm;
-      document.getElementById('originRows').innerHTML = ['X','Y','Z'].map((axis, index) =>
-        `<tr><th>${axis}</th><td>${origin ? format(origin[index]) : '—'}</td></tr>`
-      ).join('');
+      const originPixel = frame.origin_raw_uv;
+      document.getElementById('originRows').innerHTML = [
+        ['u / px', originPixel ? format(originPixel[0]) : '—'],
+        ['v / px', originPixel ? format(originPixel[1]) : '—'],
+        ['相机深度 / mm', origin ? format(origin[2]) : '—'],
+      ].map(([label, value]) => `<tr><th>${label}</th><td>${value}</td></tr>`).join('');
 
-      const rotation = frame.rotation_camera;
-      document.getElementById('rotationRows').innerHTML = rotation
-        ? rotation.map(row => `<tr>${row.map(value => `<td>${format(value, 6)}</td>`).join('')}</tr>`).join('')
-        : Array.from({length: 3}, () => '<tr><td>—</td><td>—</td><td>—</td></tr>').join('');
-
+      const triangle = frame.triangle_metrics || {};
+      const tracking = frame.tracking || {};
+      const ambiguity = tracking.ambiguity || {};
       const metrics = [
-        ['质量分数', format(frame.quality_score)],
+        ['姿态来源', frame.pose_source || 'INVALID'],
+        ['姿态置信度', format(frame.pose_confidence)],
+        ['连续估计帧龄', String(frame.temporal_age || 0)],
+        ['预测三角可见率', format(tracking.prediction_visible_fraction)],
+        ['直接/预测顶点误差', format(tracking.direct_prediction_error_ratio)],
+        ['光流内点比例', format(tracking.inlier_ratio)],
+        ['多候选连续消歧', ambiguity.ambiguity_resolved ? `候选 ${Number(ambiguity.selected_index) + 1}` : '—'],
+        ['候选分数差', format(ambiguity.score_margin)],
+        ['C 高度/底边', format(triangle.tip_height_ratio)],
+        ['C 侧偏/底边', format(triangle.tip_side_ratio)],
         ['有效视差比例', format(frame.valid_ratio)],
         ['平面内点比例', format(frame.inlier_ratio)],
         ['空间覆盖率', format(frame.spatial_coverage)],

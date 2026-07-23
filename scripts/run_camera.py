@@ -26,8 +26,12 @@ from triangle_locator.calibration import (
 from triangle_locator.pipeline import TriangleLocator, append_result_jsonl, write_result_json
 
 
-ORBBEC_PYTHON_DIR = Path('/home/depthai/venv/enpower/vision-model/pyorbbecsdk/install_286/lib')
-ORBBEC_SDK_DIR = Path('/home/depthai/OrbbecSDK_v2/OrbbecSDK_v2.8.6_202604271452_6399409_linux_x86_64')
+ORBBEC_PYTHON_DIR = Path(
+  os.environ.get('PYORBBECSDK_LIB', '/home/depthai/venv/enpower/vision-model/pyorbbecsdk/install_286/lib')
+)
+ORBBEC_SDK_DIR = Path(
+  os.environ.get('ORBBEC_SDK_DIR', '/home/depthai/OrbbecSDK_v2/OrbbecSDK_v2.8.6_202604271452_6399409_linux_x86_64')
+)
 ORBBEC_STREAM_CPP = code_dir / 'orbbec_dual_color_stream.cpp'
 ORBBEC_STREAM_BIN = repo_dir / 'build' / 'orbbec_probe' / 'orbbec_dual_color_stream'
 ORBBEC_PACKET_HEADER = struct.Struct('<4s5I7Q')
@@ -528,9 +532,11 @@ def rectifier_for_source(source, config):
       calibration.T.reshape(3).tolist(),
     )
   try:
+    rectification = config.get('rectification') or {}
     return StereoRectifier(
       calibration,
-      alpha=float((config.get('rectification') or {}).get('alpha', 0.0)),
+      alpha=float(rectification.get('alpha', 0.0)),
+      enabled=bool(rectification.get('enabled', True)),
     )
   except (ValueError, cv2.error) as exc:
     raise RuntimeError(f'RECTIFICATION_INVALID: {exc}') from exc
@@ -589,7 +595,10 @@ def main(argv=None):
     worker = LatestFrameWorker(sdk_source)
     worker.start()
     rectifier = rectifier_for_source(sdk_source, config)
-    run_demo.configure_runtime()
+    runtime_config = config.get('runtime') or {}
+    run_demo.configure_runtime(
+      disable_torch_compile=bool(runtime_config.get('disable_torch_compile', False)),
+    )
     model_args = run_demo.load_args(run_config.runtime_overrides(config))
     model_args.show = 0
     model_args.intrinsic_file = None
@@ -657,9 +666,13 @@ def main(argv=None):
         screw_valid_count += 1
         screw_pixels.append([result['screw_u_raw'], result['screw_v_raw']])
       logging.info(
-        'frame=%s plate_valid=%s screw_valid=%s reason=%s total=%.1fms captured=%s processed=%s dropped=%s',
+        'frame=%s plate_valid=%s pose_source=%s pose_conf=%.3f temporal_age=%s '
+        'screw_valid=%s reason=%s total=%.1fms captured=%s processed=%s dropped=%s',
         frame_id,
         result['plate_valid'],
+        result.get('pose_source'),
+        float(result.get('pose_confidence') or 0.0),
+        result.get('temporal_age'),
         result['screw_valid'],
         result['invalid_reason'],
         result['timings_ms']['total_ms'],

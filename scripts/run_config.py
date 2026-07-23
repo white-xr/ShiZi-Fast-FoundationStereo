@@ -688,9 +688,11 @@ def run_offline_locator(config, pairs, output_root):
     write_result_json(sample_out_dir / 'result.json', result)
     results.append(result)
     logging.info(
-      '[%d/%d] frame=%s plate_valid=%s screw_valid=%s reason=%s total=%.1fms',
-      index, len(pairs), pair['name'], result['plate_valid'], result['screw_valid'],
-      result['invalid_reason'], result['timings_ms']['total_ms'],
+      '[%d/%d] frame=%s plate_valid=%s source=%s pose_conf=%.3f age=%s '
+      'screw_valid=%s reason=%s total=%.1fms',
+      index, len(pairs), pair['name'], result['plate_valid'], result.get('pose_source'),
+      float(result.get('pose_confidence') or 0.0), result.get('temporal_age'),
+      result['screw_valid'], result['invalid_reason'], result['timings_ms']['total_ms'],
     )
 
   valid_plates = [item for item in results if item['plate_valid']]

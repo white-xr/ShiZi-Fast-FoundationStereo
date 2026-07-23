@@ -56,6 +56,14 @@ def _morph(mask, open_kernel=0, close_kernel=0):
   return out.astype(bool)
 
 
+def postprocess_mask(mask, config):
+  return _morph(
+    np.asarray(mask, dtype=bool),
+    int(config.get('morph_open_kernel', 0) or 0),
+    int(config.get('morph_close_kernel', 0) or 0),
+  )
+
+
 def _save_mask(path, mask):
   imageio.imwrite(path, (mask.astype(np.uint8) * 255))
 
@@ -219,10 +227,8 @@ def run_yolo_seg_array(left_bgr, output_dir, config, repo_dir, write_debug=False
   if tip_candidates:
     tip_mask = max(tip_candidates, key=lambda item: item['confidence'])['mask']
 
-  open_kernel = int(config.get('morph_open_kernel', 0) or 0)
-  close_kernel = int(config.get('morph_close_kernel', 0) or 0)
-  target_mask = _morph(target_mask, open_kernel, close_kernel)
-  tip_mask = _morph(tip_mask, open_kernel, close_kernel)
+  target_mask = postprocess_mask(target_mask, config)
+  tip_mask = postprocess_mask(tip_mask, config)
 
   if output_dir is not None and write_debug:
     output_dir.mkdir(parents=True, exist_ok=True)

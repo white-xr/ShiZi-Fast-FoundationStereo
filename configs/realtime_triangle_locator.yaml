@@ -1,4 +1,7 @@
 input_mode: realtime
+runtime:
+  # Avoid the first-frame torch.compile power/load spike on this 6 GB workstation.
+  disable_torch_compile: true
 locator:
   enabled: true
 
@@ -6,8 +9,8 @@ model_dir: weights/23-36-37/model_best_bp2_serialize.pth
 # Real-time startup reads K/D/R/T from the active SDK profiles first.
 # This file is only the explicit factory-SDK fallback.
 stereo_calibration_file: configs/stereo_calib.yaml
-valid_iters: 8
-max_disp: 128
+valid_iters: 2
+max_disp: 96
 build_volume_backend: pytorch1
 low_memory: 1
 scale: 1
@@ -23,7 +26,7 @@ get_pc: 0
 zfar: 0.8
 
 camera:
-  source: orbbec_py
+  source: orbbec_sdk_cpp
   preset: Dual Color Streams
   stream: dual_color
   serial_number: CV2L36000024
@@ -59,9 +62,10 @@ segmentation:
   debug_vis: false
 
 rectification:
+  enabled: false
   alpha: 0.0
 rectification_quality:
-  enabled: true
+  enabled: false
   max_features: 1200
   min_matches: 20
   ratio_test: 0.75
@@ -70,7 +74,9 @@ rectification_quality:
 synchronization:
   require_timestamps: true
   max_delta_ms: 2.0
-  max_frame_index_delta: 0
+  # Dual Color Streams are timestamp-synchronized, but their sensor counters
+  # start with a stable offset on this firmware (observed left-right = 3).
+  max_frame_index_delta: 4
 roi:
   context_padding_px: 32
   padding_px: 8
@@ -94,6 +100,11 @@ plane:
   min_spatial_coverage: 0.55
   max_rmse_px: 1.0
 pose:
+  # YOLO 外轮廓到三角板物理 A/B/C 的重心坐标映射。
+  semantic_vertex_weights:
+    - [0.74491902, 0.13361036, 0.12147062]
+    - [0.08947715, 0.77073700, 0.13978585]
+    - [0.10800542, 0.14184271, 0.75015187]
   min_contour_area_px: 500
   min_contour_iou: 0.45
   min_occluded_contour_iou: 0.35
@@ -103,7 +114,48 @@ pose:
   min_visible_fraction: 0.25
   min_mask_containment: 0.85
   max_fit_error_px: 6.0
+  min_tip_height_ratio: 0.20
+  max_tip_height_ratio: 1.60
+  max_tip_side_ratio: 0.60
+  min_tip_below_px: 1.0
+  min_base_length_px: 12.0
   min_previous_normal_dot: 0.0
+  temporal:
+    enabled: true
+    max_estimated_frames: 45
+    max_frame_gap: 60
+    max_interval_ms: 2000.0
+    anchor_use_target_mask: false
+    feature_padding_px: 28
+    mask_feature_padding_px: 4
+    max_features: 120
+    feature_quality: 0.01
+    feature_min_distance_px: 5.0
+    feature_block_size: 7
+    lk_window_px: 31
+    lk_max_level: 4
+    lk_iterations: 30
+    lk_epsilon: 0.01
+    max_fb_error_px: 1.5
+    min_tracked_points: 8
+    ransac_threshold_px: 2.0
+    ransac_iterations: 500
+    ransac_confidence: 0.99
+    ransac_refine_iterations: 10
+    min_inlier_points: 6
+    min_inlier_ratio: 0.50
+    min_scale: 0.65
+    max_scale: 1.55
+    max_rotation_deg: 35.0
+    max_direct_prediction_error_ratio: 0.05
+    min_direct_visible_fraction: 0.75
+    min_direct_mask_area_ratio: 0.75
+    min_candidate_visible_fraction: 0.25
+    min_candidate_mask_containment: 0.70
+    min_candidate_score: 0.15
+    min_candidate_score_margin: 0.08
+    max_vertex_outside_roi_px: 2.0
+    confidence_scale: 0.60
 screw:
   offset_file: configs/screw_offset.yaml
 output:
@@ -122,8 +174,8 @@ safety:
   enabled: true
   action: error
   max_scale: 1.0
-  max_valid_iters: 8
-  max_max_disp: 128
+  max_valid_iters: 2
+  max_max_disp: 96
   require_low_memory_when_vram_gb_lte: 6.5
   min_free_vram_gb: 1.0
   require_healthy_gpu: true

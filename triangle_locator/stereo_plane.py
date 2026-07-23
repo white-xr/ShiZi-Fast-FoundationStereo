@@ -17,6 +17,69 @@ class PlaneFitResult:
   metrics: dict
 
 
+def _stereo_value(stereo_geometry, key):
+  if isinstance(stereo_geometry, dict):
+    return stereo_geometry[key]
+  return getattr(stereo_geometry, key)
+
+
+def _raw_stereo_matrices(stereo_geometry):
+  K1 = np.asarray(_stereo_value(stereo_geometry, 'K1'), dtype=np.float64).reshape(3, 3)
+  K2 = np.asarray(_stereo_value(stereo_geometry, 'K2'), dtype=np.float64).reshape(3, 3)
+  R = np.asarray(_stereo_value(stereo_geometry, 'R'), dtype=np.float64).reshape(3, 3)
+  T = np.asarray(_stereo_value(stereo_geometry, 'T'), dtype=np.float64).reshape(3)
+  P1 = K1 @ np.column_stack((np.eye(3), np.zeros(3, dtype=np.float64)))
+  P2 = K2 @ np.column_stack((R, T))
+  skew_t = np.array([
+    [0.0, -T[2], T[1]],
+    [T[2], 0.0, -T[0]],
+    [-T[1], T[0], 0.0],
+  ], dtype=np.float64)
+  fundamental = np.linalg.inv(K2).T @ skew_t @ R @ np.linalg.inv(K1)
+  return P1, P2, fundamental, R, T
+
+
+def triangulate_pixels_with_disparity(pixels, disparity, stereo_geometry):
+  """Triangulate horizontal FFS correspondences in unrectified camera geometry."""
+  pixels = np.asarray(pixels, dtype=np.float64).reshape(-1, 2)
+  disparity = np.asarray(disparity, dtype=np.float64).reshape(-1)
+  if len(pixels) != len(disparity):
+    raise ValueError('pixels and disparity must contain the same number of samples')
+  P1, P2, fundamental, R, T = _raw_stereo_matrices(stereo_geometry)
+  right_u = pixels[:, 0] - disparity
+  left_h = np.column_stack((pixels, np.ones(len(pixels), dtype=np.float64)))
+  right_lines = (fundamental @ left_h.T).T
+  right_v = pixels[:, 1].copy()
+  stable = np.abs(right_lines[:, 1]) > 1e-12
+  right_v[stable] = -(
+    right_lines[stable, 0] * right_u[stable] + right_lines[stable, 2]
+  ) / right_lines[stable, 1]
+  right_pixels = np.column_stack((right_u, right_v))
+  homogeneous = cv2.triangulatePoints(P1, P2, pixels.T, right_pixels.T)
+  w = homogeneous[3]
+  points = np.full((len(pixels), 3), np.nan, dtype=np.float64)
+  finite = np.isfinite(homogeneous).all(axis=0) & (np.abs(w) > 1e-12)
+  points[finite] = (homogeneous[:3, finite] / w[finite]).T
+  right_points = (R @ points.T).T + T
+  cheirality = finite & (points[:, 2] > 0) & (right_points[:, 2] > 0)
+  points[~cheirality] = np.nan
+  return points
+
+
+def _fit_camera_plane(points):
+  points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+  points = points[np.isfinite(points).all(axis=1)]
+  if len(points) < 3:
+    raise ValueError('not enough finite 3D points for a camera plane')
+  center = points.mean(axis=0)
+  _, _, vh = np.linalg.svd(points - center, full_matrices=False)
+  normal = vh[-1]
+  if normal[2] < 0:
+    normal = -normal
+  normal /= np.linalg.norm(normal)
+  return np.array([*normal, -float(normal @ center)], dtype=np.float64)
+
+
 def erode_mask(mask, pixels=0, relative=0.0):
   mask = np.asarray(mask, dtype=bool)
   relative_pixels = int(round(min(mask.shape) * float(relative or 0.0)))
@@ -84,7 +147,15 @@ def disparity_plane_to_camera(coefficients, K, baseline_m):
   return np.array([*(normal / norm), -rhs / norm], dtype=np.float64)
 
 
-def fit_disparity_plane(disparity, mask, K, baseline_m, config=None, validity_mask=None):
+def fit_disparity_plane(
+  disparity,
+  mask,
+  K,
+  baseline_m,
+  config=None,
+  validity_mask=None,
+  stereo_geometry=None,
+):
   config = config or {}
   disparity = np.asarray(disparity, dtype=np.float64)
   eroded = erode_mask(
@@ -102,7 +173,19 @@ def fit_disparity_plane(disparity, mask, K, baseline_m, config=None, validity_ma
     valid &= disparity <= float(max_disp)
 
   depth = np.zeros_like(disparity)
-  depth[valid] = float(K[0, 0]) * float(baseline_m) / disparity[valid]
+  if stereo_geometry is None:
+    depth[valid] = float(K[0, 0]) * float(baseline_m) / disparity[valid]
+  else:
+    candidate_y, candidate_x = np.where(valid)
+    candidate_points = triangulate_pixels_with_disparity(
+      np.column_stack((candidate_x, candidate_y)),
+      disparity[valid],
+      stereo_geometry,
+    )
+    candidate_depth = candidate_points[:, 2]
+    finite_depth = np.isfinite(candidate_depth) & (candidate_depth > 0)
+    depth[candidate_y[finite_depth], candidate_x[finite_depth]] = candidate_depth[finite_depth]
+    valid[candidate_y[~finite_depth], candidate_x[~finite_depth]] = False
   min_depth = float(config.get('min_depth_m', 0.0) or 0.0)
   max_depth = float(config.get('max_depth_m', 0.0) or 0.0)
   if min_depth > 0:
@@ -167,10 +250,21 @@ def fit_disparity_plane(disparity, mask, K, baseline_m, config=None, validity_ma
   disparity_rmse = float(np.sqrt(np.mean(np.square(residuals[inlier_values])))) if inlier_count else None
   fitted_at_inliers = design[inlier_values] @ refined
   measured_at_inliers = values[inlier_values]
-  depth_errors = float(K[0, 0]) * float(baseline_m) * (
-    1.0 / measured_at_inliers - 1.0 / fitted_at_inliers
-  )
-  depth_rmse_mm = float(np.sqrt(np.mean(np.square(depth_errors))) * 1000.0) if inlier_count else None
+  if stereo_geometry is None:
+    depth_errors = float(K[0, 0]) * float(baseline_m) * (
+      1.0 / measured_at_inliers - 1.0 / fitted_at_inliers
+    )
+  else:
+    inlier_pixels = np.column_stack((xs[inlier_values], ys[inlier_values]))
+    measured_xyz = triangulate_pixels_with_disparity(
+      inlier_pixels, measured_at_inliers, stereo_geometry,
+    )
+    fitted_xyz = triangulate_pixels_with_disparity(
+      inlier_pixels, fitted_at_inliers, stereo_geometry,
+    )
+    depth_errors = measured_xyz[:, 2] - fitted_xyz[:, 2]
+    depth_errors = depth_errors[np.isfinite(depth_errors)]
+  depth_rmse_mm = float(np.sqrt(np.mean(np.square(depth_errors))) * 1000.0) if len(depth_errors) else None
   coverage = _spatial_coverage(
     eroded,
     inlier_mask,
@@ -208,19 +302,39 @@ def fit_disparity_plane(disparity, mask, K, baseline_m, config=None, validity_ma
   all_y, all_x = np.indices(disparity.shape)
   fitted[eroded] = (refined[0] * all_x[eroded] + refined[1] * all_y[eroded] + refined[2]).astype(np.float32)
   try:
-    camera_plane = disparity_plane_to_camera(refined, K, baseline_m)
+    if stereo_geometry is None:
+      camera_plane = disparity_plane_to_camera(refined, K, baseline_m)
+    else:
+      plane_pixels = np.column_stack((xs[inlier_values], ys[inlier_values]))
+      plane_points = triangulate_pixels_with_disparity(
+        plane_pixels,
+        fitted_at_inliers,
+        stereo_geometry,
+      )
+      camera_plane = _fit_camera_plane(plane_points)
   except ValueError:
     return PlaneFitResult(False, 'PLANE_FIT_FAILED', refined, None, eroded, valid, inlier_mask, fitted, metrics)
   return PlaneFitResult(passes, None if passes else 'PLANE_QUALITY_LOW', refined, camera_plane, eroded, valid, inlier_mask, fitted, metrics)
 
 
-def intersect_pixels_with_disparity_plane(pixels, coefficients, K, baseline_m):
+def intersect_pixels_with_disparity_plane(
+  pixels,
+  coefficients,
+  K,
+  baseline_m,
+  stereo_geometry=None,
+):
   pixels = np.asarray(pixels, dtype=np.float64).reshape(-1, 2)
   coefficients = np.asarray(coefficients, dtype=np.float64)
   K = np.asarray(K, dtype=np.float64)
   disparity = coefficients[0] * pixels[:, 0] + coefficients[1] * pixels[:, 1] + coefficients[2]
   if np.any(~np.isfinite(disparity)) or np.any(disparity <= 0):
     raise ValueError('triangle vertex has invalid fitted disparity')
+  if stereo_geometry is not None:
+    points = triangulate_pixels_with_disparity(pixels, disparity, stereo_geometry)
+    if np.any(~np.isfinite(points)):
+      raise ValueError('triangle vertex cannot be triangulated in raw stereo geometry')
+    return points
   z = K[0, 0] * float(baseline_m) / disparity
   x = (pixels[:, 0] - K[0, 2]) * z / K[0, 0]
   y = (pixels[:, 1] - K[1, 2]) * z / K[1, 1]
