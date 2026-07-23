@@ -84,7 +84,7 @@ def disparity_plane_to_camera(coefficients, K, baseline_m):
   return np.array([*(normal / norm), -rhs / norm], dtype=np.float64)
 
 
-def fit_disparity_plane(disparity, mask, K, baseline_m, config=None):
+def fit_disparity_plane(disparity, mask, K, baseline_m, config=None, validity_mask=None):
   config = config or {}
   disparity = np.asarray(disparity, dtype=np.float64)
   eroded = erode_mask(
@@ -95,6 +95,8 @@ def fit_disparity_plane(disparity, mask, K, baseline_m, config=None):
   mask_pixels = int(np.count_nonzero(eroded))
   valid = eroded & np.isfinite(disparity)
   valid &= disparity > float(config.get('min_disp', 0.1))
+  if validity_mask is not None:
+    valid &= np.asarray(validity_mask, dtype=bool)
   max_disp = config.get('max_disp')
   if max_disp not in {None, '', 0}:
     valid &= disparity <= float(max_disp)

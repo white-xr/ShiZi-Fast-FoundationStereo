@@ -1,6 +1,10 @@
 input_mode: image
 locator:
   enabled: true
+runtime:
+  # Flask inference can run outside the main thread; eager mode avoids a
+  # PyTorch 2.6 Dynamo CUDA device-cache failure on this machine.
+  disable_torch_compile: true
 
 model_dir: weights/23-36-37/model_best_bp2_serialize.pth
 stereo_calibration_file: configs/stereo_calib.yaml
@@ -22,6 +26,7 @@ zfar: 0.8
 
 segmentation:
   enabled: true
+  input_coordinate: raw_left
   model_path: weights/triangle-metal.pt
   imgsz: 960
   conf_thres: 0.35
@@ -39,15 +44,19 @@ segmentation:
   draw_masks: true
 
 rectification:
+  # Offline visualization uses the captured pixels directly for YOLO and FFS.
+  enabled: false
   alpha: 0.0
 rectification_quality:
-  enabled: true
+  enabled: false
   max_features: 1600
   min_matches: 20
   ratio_test: 0.75
   max_median_px: 0.5
   max_p95_px: 1.5
 synchronization:
+  # 离线左右图片按同名文件配对，不要求数据集额外提供 timestamps.csv。
+  require_timestamps: false
   max_delta_ms: 2.0
   max_frame_index_delta: 0
 roi:
@@ -75,9 +84,19 @@ plane:
 pose:
   min_contour_area_px: 500
   min_contour_iou: 0.45
+  # 电批遮挡时，同一个 YOLO 实例会由左右两个可见区域组成。
+  min_occluded_contour_iou: 0.35
+  min_component_area_px: 32
+  min_component_area_ratio: 0.08
+  max_components: 4
+  min_visible_fraction: 0.25
+  min_mask_containment: 0.85
   max_fit_error_px: 6.0
   min_previous_normal_dot: 0.0
+visualization:
+  axis_length_m: 0.03
 screw:
+  enabled: false
   offset_file: configs/screw_offset.yaml
 debug:
   enabled: true
@@ -104,4 +123,3 @@ append_data_name_to_run_dir: true
 overwrite: true
 batch:
   pattern: "*.png"
-  ids: ["000011"]

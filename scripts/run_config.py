@@ -707,7 +707,7 @@ def run_offline_locator(config, pairs, output_root):
       item['plate_origin_camera_m'] for item in valid_plates
     ], axis=0).tolist() if len(valid_plates) > 1 else None,
     'screw_uv_std_px': np.std([
-      [item['screw_u'], item['screw_v']] for item in valid_screws
+      [item['screw_u_raw'], item['screw_v_raw']] for item in valid_screws
     ], axis=0).tolist() if len(valid_screws) > 1 else None,
     'timings_ms': {
       key: {

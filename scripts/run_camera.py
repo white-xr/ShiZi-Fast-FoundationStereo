@@ -5,7 +5,6 @@ import os
 import queue
 import struct
 import subprocess
-import shutil
 import sys
 import threading
 import time
@@ -13,16 +12,18 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
-from omegaconf import OmegaConf
 
 code_dir = Path(__file__).resolve().parent
 repo_dir = code_dir.parent
 sys.path.append(str(repo_dir))
 
 from scripts import run_config, run_demo
-from triangle_locator.calibration import StereoRectifier
-from triangle_locator.pipeline import TriangleLocator, append_result_jsonl
+from triangle_locator.calibration import (
+  StereoRectifier,
+  load_stereo_calibration,
+  stereo_calibration_from_sdk_profiles,
+)
+from triangle_locator.pipeline import TriangleLocator, append_result_jsonl, write_result_json
 
 
 ORBBEC_PYTHON_DIR = Path('/home/depthai/venv/enpower/vision-model/pyorbbecsdk/install_286/lib')
@@ -35,11 +36,7 @@ ORBBEC_PACKET_HEADER = struct.Struct('<4s5I7Q')
 def parse_args(argv=None):
   parser = argparse.ArgumentParser(description='Run FoundationStereo from a live stereo camera.')
   parser.add_argument('--config', default='configs/stereo_infer.yaml', help='YAML config path')
-  parser.add_argument('--mode', choices=['split', 'two'], default=None, help='split: one side-by-side camera; two: two camera devices')
-  parser.add_argument('--camera', default=None, help='camera index or device path for split mode')
-  parser.add_argument('--left_camera', default=None, help='left camera index or device path for two mode')
-  parser.add_argument('--right_camera', default=None, help='right camera index or device path for two mode')
-  parser.add_argument('--width', type=int, default=None, help='capture width; split mode should be left+right total width')
+  parser.add_argument('--width', type=int, default=None, help='Dual RGB frame width')
   parser.add_argument('--height', type=int, default=None, help='capture height')
   parser.add_argument('--fps', type=int, default=None, help='requested camera FPS')
   parser.add_argument('--interval_sec', type=float, default=None, help='sleep seconds after each inference')
@@ -57,24 +54,6 @@ def camera_cfg(config, key, default=None):
 
 def cli_or_config(cli_value, config, key, default=None):
   return cli_value if cli_value is not None else camera_cfg(config, key, default)
-
-
-def capture_ref(value):
-  text = str(value)
-  return int(text) if text.isdigit() else text
-
-
-def open_capture(index, width=None, height=None, fps=None):
-  cap = cv2.VideoCapture(capture_ref(index))
-  if not cap.isOpened():
-    raise RuntimeError(f'打不开摄像头：{index}')
-  if width:
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
-  if height:
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-  if fps:
-    cap.set(cv2.CAP_PROP_FPS, int(fps))
-  return cap
 
 
 def load_orbbec_sdk():
@@ -159,6 +138,56 @@ def pick_profile(pipeline, sensor_type, width, height, fps, formats, ob):
   raise RuntimeError(f'找不到 {sensor_type} 的 {width}x{height}@{fps} profile，候选格式：{formats}')
 
 
+def device_identity(device):
+  info = device.get_device_info()
+  return {
+    'name': str(info.get_name()),
+    'serial_number': str(info.get_serial_number()),
+    'firmware_version': str(info.get_firmware_version()),
+  }
+
+
+def validate_device_identity(device, config):
+  identity = device_identity(device)
+  expected_serial = str(camera_cfg(config, 'serial_number', '') or '').strip()
+  if expected_serial and identity['serial_number'] != expected_serial:
+    raise RuntimeError(
+      f'Orbbec serial mismatch: expected={expected_serial}, actual={identity["serial_number"]}'
+    )
+  logging.info(
+    'Orbbec device: name=%s serial=%s firmware=%s',
+    identity['name'], identity['serial_number'], identity['firmware_version'],
+  )
+  return identity
+
+
+def select_dual_color_profiles(pipeline, config, ob, formats=None):
+  device = pipeline.get_device()
+  left_sensor = ob.OBSensorType.LEFT_COLOR_SENSOR
+  right_sensor = ob.OBSensorType.RIGHT_COLOR_SENSOR
+  if not sensor_available(device, left_sensor) or not sensor_available(device, right_sensor):
+    raise RuntimeError('Gemini 305 does not expose both LEFT_COLOR_SENSOR and RIGHT_COLOR_SENSOR')
+  width = int(camera_cfg(config, 'width', 1280))
+  height = int(camera_cfg(config, 'height', 800))
+  fps = int(camera_cfg(config, 'fps', 30))
+  candidates = formats or camera_cfg(config, 'formats', ['BGR', 'RGB', 'YUYV', 'MJPG'])
+  left = pick_profile(pipeline, left_sensor, width, height, fps, candidates, ob)
+  right = pick_profile(pipeline, right_sensor, width, height, fps, candidates, ob)
+  return left, right
+
+
+def frameset_dual_color_frames(frames, ob):
+  left_getter = getattr(frames, 'get_left_color_frame', None)
+  right_getter = getattr(frames, 'get_right_color_frame', None)
+  if left_getter is not None and right_getter is not None:
+    return left_getter(), right_getter()
+  # SDK 2.8.6 Python bindings expose generic get_frame for these frame types.
+  return (
+    frames.get_frame(ob.OBFrameType.LEFT_COLOR_FRAME),
+    frames.get_frame(ob.OBFrameType.RIGHT_COLOR_FRAME),
+  )
+
+
 def build_orbbec_streamer():
   include_dir = ORBBEC_SDK_DIR / 'include'
   lib_dir = ORBBEC_SDK_DIR / 'lib'
@@ -204,6 +233,26 @@ def read_exact(stream, size):
 
 class CppOrbbecStereoSource:
   def __init__(self, config):
+    self.calibration = None
+    if bool(camera_cfg(config, 'query_sdk_calibration', True)):
+      try:
+        ob = load_orbbec_sdk()
+        probe = ob.Pipeline()
+        device = probe.get_device()
+        preset = str(camera_cfg(config, 'preset', 'Dual Color Streams'))
+        device.load_preset(preset)
+        identity = validate_device_identity(device, config)
+        left_profile, right_profile = select_dual_color_profiles(probe, config, ob, formats=['BGR'])
+        self.calibration = stereo_calibration_from_sdk_profiles(
+          left_profile,
+          right_profile,
+          source=f'Orbbec SDK {identity["serial_number"]} Dual RGB profiles',
+        )
+        del left_profile, right_profile, device, probe
+      except Exception as exc:
+        if not bool(camera_cfg(config, 'allow_calibration_fallback', True)):
+          raise
+        logging.warning('SDK calibration query failed; configured fallback may be used: %s', exc)
     binary = build_orbbec_streamer()
     width = int(camera_cfg(config, 'width', 1280))
     height = int(camera_cfg(config, 'height', 800))
@@ -270,9 +319,11 @@ class CppOrbbecStereoSource:
 
 class OrbbecStereoSource:
   def __init__(self, config):
+    self._runtime_config = config
     self.ob = load_orbbec_sdk()
     self.pipeline = self.ob.Pipeline()
     self.device = self.pipeline.get_device()
+    self.identity = validate_device_identity(self.device, config)
     self.config = self.ob.Config()
 
     preset = camera_cfg(config, 'preset')
@@ -305,8 +356,21 @@ class OrbbecStereoSource:
     right = self.ob.OBSensorType.RIGHT_COLOR_SENSOR
     if not sensor_available(self.device, left) or not sensor_available(self.device, right):
       return False
-    self.config.enable_stream(pick_profile(self.pipeline, left, width, height, fps, formats, self.ob))
-    self.config.enable_stream(pick_profile(self.pipeline, right, width, height, fps, formats, self.ob))
+    self.left_profile = pick_profile(self.pipeline, left, width, height, fps, formats, self.ob)
+    self.right_profile = pick_profile(self.pipeline, right, width, height, fps, formats, self.ob)
+    try:
+      self.calibration = stereo_calibration_from_sdk_profiles(
+        self.left_profile,
+        self.right_profile,
+        source=f'Orbbec SDK {self.identity["serial_number"]} Dual RGB profiles',
+      )
+    except Exception as exc:
+      if not bool(camera_cfg(self._runtime_config, 'allow_calibration_fallback', True)):
+        raise
+      self.calibration = None
+      logging.warning('SDK calibration query failed; configured fallback may be used: %s', exc)
+    self.config.enable_stream(self.left_profile)
+    self.config.enable_stream(self.right_profile)
     return True
 
   def _enable_dual_ir(self, width, height, fps, formats):
@@ -320,10 +384,7 @@ class OrbbecStereoSource:
 
   def read(self):
     started = time.perf_counter()
-    if self.stream == 'dual_color':
-      left_type = self.ob.OBFrameType.LEFT_COLOR_FRAME
-      right_type = self.ob.OBFrameType.RIGHT_COLOR_FRAME
-    else:
+    if self.stream != 'dual_color':
       left_type = self.ob.OBFrameType.LEFT_IR_FRAME
       right_type = self.ob.OBFrameType.RIGHT_IR_FRAME
 
@@ -331,8 +392,11 @@ class OrbbecStereoSource:
       frames = self.pipeline.wait_for_frames(1000)
       if frames is None:
         continue
-      left = frames.get_frame(left_type)
-      right = frames.get_frame(right_type)
+      if self.stream == 'dual_color':
+        left, right = frameset_dual_color_frames(frames, self.ob)
+      else:
+        left = frames.get_frame(left_type)
+        right = frames.get_frame(right_type)
       if left is not None and right is not None:
         left_timestamp_ms = left.get_timestamp_us() / 1000.0
         right_timestamp_ms = right.get_timestamp_us() / 1000.0
@@ -401,25 +465,6 @@ class LatestFrameWorker:
     self.thread.join(timeout=2.0)
 
 
-def read_or_fail(cap, label):
-  ok, frame = cap.read()
-  if not ok or frame is None:
-    raise RuntimeError(f'读取 {label} 失败')
-  return frame
-
-
-def split_side_by_side(frame):
-  h, w = frame.shape[:2]
-  if w < 2:
-    raise RuntimeError(f'摄像头画面宽度异常：{w}')
-  mid = w // 2
-  return frame[:, :mid], frame[:, mid:]
-
-
-def to_rgb(frame_bgr):
-  return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-
 def make_output_dir(base_dir, frame_id, save_frames):
   base_dir = Path(base_dir)
   if save_frames:
@@ -454,13 +499,6 @@ def is_low_information_frame(left_bgr, right_bgr, min_std):
   return left_std < min_std or right_std < min_std
 
 
-def prepare_output_dir(out_dir, save_frames):
-  out_dir = Path(out_dir)
-  if not save_frames and out_dir.exists():
-    shutil.rmtree(out_dir)
-  out_dir.mkdir(parents=True, exist_ok=True)
-
-
 def preview_pair(left_bgr, right_bgr):
   if right_bgr.shape[:2] != left_bgr.shape[:2]:
     right_bgr = cv2.resize(right_bgr, (left_bgr.shape[1], left_bgr.shape[0]))
@@ -469,73 +507,45 @@ def preview_pair(left_bgr, right_bgr):
   return cv2.waitKey(1) & 0xFF
 
 
-class LivePointCloudViewer:
-  def __init__(self, enabled, point_size=1.0, voxel_size=0):
-    self.enabled = bool(enabled)
-    self.point_size = float(point_size)
-    self.voxel_size = float(voxel_size or 0)
-    self.vis = None
-    self.pcd = None
-    self.view_initialized = False
-
-    if not self.enabled:
-      return
-    if run_demo.o3d is None:
-      logging.warning('open3d 不可用，无法实时可视化点云。')
-      self.enabled = False
-      return
-    if not os.environ.get('DISPLAY') and Path('/tmp/.X11-unix/X0').exists():
-      os.environ['DISPLAY'] = ':0'
-      logging.info('当前终端没有 DISPLAY，已自动使用本机桌面 DISPLAY=:0。')
-    if not os.environ.get('DISPLAY'):
-      logging.warning('当前没有 DISPLAY，无法弹出 Open3D 点云窗口；仍会保存 camera_latest/cloud.ply。')
-      self.enabled = False
-      return
-
-    self.vis = run_demo.o3d.visualization.Visualizer()
-    self.vis.create_window('Live Point Cloud', width=1280, height=720)
-    render = self.vis.get_render_option()
-    render.point_size = self.point_size
-    render.background_color = np.array([0.05, 0.05, 0.05])
-
-  def update(self, pcd):
-    if not self.enabled or pcd is None:
-      return True
-    if len(np.asarray(pcd.points)) == 0:
-      return True
-
-    if self.voxel_size > 0:
-      pcd = pcd.voxel_down_sample(self.voxel_size)
-
-    if self.pcd is None:
-      self.pcd = pcd
-      self.vis.add_geometry(self.pcd)
-    else:
-      self.pcd.points = pcd.points
-      self.pcd.colors = pcd.colors
-      self.vis.update_geometry(self.pcd)
-
-    if not self.view_initialized:
-      ctr = self.vis.get_view_control()
-      points = np.asarray(self.pcd.points)
-      ctr.set_front([0, 0, -1])
-      ctr.set_lookat(points[points[:, 2].argmin()])
-      ctr.set_up([0, -1, 0])
-      self.view_initialized = True
-
-    keep_running = self.vis.poll_events()
-    self.vis.update_renderer()
-    return keep_running
-
-  def close(self):
-    if self.vis is not None:
-      self.vis.destroy_window()
+def rectifier_for_source(source, config):
+  calibration = getattr(source, 'calibration', None)
+  if calibration is None:
+    if not bool(camera_cfg(config, 'allow_calibration_fallback', True)):
+      raise RuntimeError('RECTIFICATION_INVALID: Orbbec SDK calibration is unavailable')
+    calibration_file = config.get('stereo_calibration_file')
+    if not calibration_file:
+      raise RuntimeError('RECTIFICATION_INVALID: no SDK calibration and no fallback file')
+    try:
+      calibration = load_stereo_calibration(run_config.resolve_path(calibration_file))
+    except (ValueError, FileNotFoundError) as exc:
+      raise RuntimeError(f'RECTIFICATION_INVALID: {exc}') from exc
+    logging.warning('Using stereo calibration fallback: %s', calibration.source)
+  else:
+    logging.info(
+      'Using live SDK stereo calibration: source=%s baseline=%.9fm T=%s',
+      calibration.source,
+      calibration.baseline_m,
+      calibration.T.reshape(3).tolist(),
+    )
+  try:
+    return StereoRectifier(
+      calibration,
+      alpha=float((config.get('rectification') or {}).get('alpha', 0.0)),
+    )
+  except (ValueError, cv2.error) as exc:
+    raise RuntimeError(f'RECTIFICATION_INVALID: {exc}') from exc
 
 
 def main(argv=None):
   cli = parse_args(argv)
   config_path = run_config.resolve_path(cli.config)
   config = run_config.apply_runtime_safety(run_config.load_yaml(config_path))
+  camera = dict(config.get('camera') or {})
+  for key in ('width', 'height', 'fps'):
+    value = getattr(cli, key)
+    if value is not None:
+      camera[key] = value
+  config['camera'] = camera
   locator_config = config.get('locator') or {}
   segmentation = config.get('segmentation') or {}
   if not bool(locator_config.get('enabled', False)):
@@ -543,28 +553,6 @@ def main(argv=None):
   if not bool(segmentation.get('enabled', False)):
     raise RuntimeError('realtime triangle localization requires segmentation.enabled=true')
 
-  calibration_file = config.get('stereo_calibration_file')
-  if not calibration_file:
-    raise RuntimeError('realtime config must set stereo_calibration_file')
-  try:
-    rectifier = StereoRectifier.from_file(
-      run_config.resolve_path(calibration_file),
-      alpha=float((config.get('rectification') or {}).get('alpha', 0.0)),
-    )
-  except (ValueError, FileNotFoundError) as exc:
-    raise RuntimeError(f'RECTIFICATION_INVALID: {exc}') from exc
-
-  run_demo.configure_runtime()
-  model_args = run_demo.load_args(run_config.runtime_overrides(config))
-  model_args.show = 0
-  model_args.intrinsic_file = None
-  model = run_demo.load_model(model_args)
-  locator = TriangleLocator(model, model_args, rectifier, config, repo_dir)
-
-  mode = cli_or_config(cli.mode, config, 'mode', 'split')
-  width = cli_or_config(cli.width, config, 'width')
-  height = cli_or_config(cli.height, config, 'height')
-  fps = cli_or_config(cli.fps, config, 'fps')
   interval_sec = float(cli_or_config(cli.interval_sec, config, 'interval_sec', 0))
   max_frames = int(cli_or_config(cli.max_frames, config, 'max_frames', 0))
   source = camera_cfg(config, 'source', 'orbbec_sdk')
@@ -598,11 +586,20 @@ def main(argv=None):
     else:
       raise RuntimeError('complete realtime locator requires source=orbbec_sdk_cpp or orbbec_py')
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = out_dir / str((config.get('output') or {}).get('jsonl_file', 'results.jsonl'))
-    jsonl_path.write_text('', encoding='utf-8')
     worker = LatestFrameWorker(sdk_source)
     worker.start()
+    rectifier = rectifier_for_source(sdk_source, config)
+    run_demo.configure_runtime()
+    model_args = run_demo.load_args(run_config.runtime_overrides(config))
+    model_args.show = 0
+    model_args.intrinsic_file = None
+    model = run_demo.load_model(model_args)
+    locator = TriangleLocator(model, model_args, rectifier, config, repo_dir)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = out_dir / str((config.get('output') or {}).get('jsonl_file', 'results.jsonl'))
+    latest_json_path = out_dir / str((config.get('output') or {}).get('latest_json_file', 'latest_result.json'))
+    jsonl_path.write_text('', encoding='utf-8')
     while True:
       frame = worker.get(timeout=3.0)
       frame_id = int(frame['frame_id'])
@@ -648,6 +645,7 @@ def main(argv=None):
           break
         raise
       append_result_jsonl(jsonl_path, result)
+      write_result_json(latest_json_path, result)
       processed += 1
       timing_rows.append(result['timings_ms'])
       if result['plate_valid']:
@@ -657,7 +655,7 @@ def main(argv=None):
           plane_rmses.append(result['plane_rmse_px'])
       if result['screw_valid']:
         screw_valid_count += 1
-        screw_pixels.append([result['screw_u'], result['screw_v']])
+        screw_pixels.append([result['screw_u_raw'], result['screw_v_raw']])
       logging.info(
         'frame=%s plate_valid=%s screw_valid=%s reason=%s total=%.1fms captured=%s processed=%s dropped=%s',
         frame_id,

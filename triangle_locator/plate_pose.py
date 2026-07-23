@@ -14,6 +14,9 @@ class TriangleFit:
   contour_iou: float
   fit_error_px: float | None
   method: str | None
+  component_count: int = 0
+  visible_fraction: float = 0.0
+  mask_containment: float = 0.0
 
 
 @dataclass
@@ -45,11 +48,67 @@ def _intersect_lines(first, second):
 
 
 def _triangle_iou(mask, vertices):
+  iou, _, _ = _triangle_overlap(mask, vertices)
+  return iou
+
+
+def _triangle_overlap(mask, vertices):
   triangle = np.zeros(mask.shape, dtype=np.uint8)
   cv2.fillConvexPoly(triangle, np.round(vertices).astype(np.int32), 1)
-  intersection = np.count_nonzero(triangle.astype(bool) & mask.astype(bool))
-  union = np.count_nonzero(triangle.astype(bool) | mask.astype(bool))
-  return float(intersection / union) if union else 0.0
+  mask_bool = mask.astype(bool)
+  triangle_bool = triangle.astype(bool)
+  intersection = np.count_nonzero(triangle_bool & mask_bool)
+  union = np.count_nonzero(triangle_bool | mask_bool)
+  triangle_area = np.count_nonzero(triangle_bool)
+  mask_area = np.count_nonzero(mask_bool)
+  return (
+    float(intersection / union) if union else 0.0,
+    float(intersection / triangle_area) if triangle_area else 0.0,
+    float(intersection / mask_area) if mask_area else 0.0,
+  )
+
+
+def _meaningful_components(mask, config):
+  binary = np.asarray(mask, dtype=np.uint8)
+  count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+  if count <= 1:
+    return np.zeros(binary.shape, dtype=np.uint8), 0
+
+  components = sorted(
+    ((label, int(stats[label, cv2.CC_STAT_AREA])) for label in range(1, count)),
+    key=lambda item: item[1],
+    reverse=True,
+  )
+  largest_area = components[0][1]
+  min_component_area = max(
+    int(config.get('min_component_area_px', 32)),
+    int(round(largest_area * float(config.get('min_component_area_ratio', 0.08)))),
+  )
+  max_components = max(1, int(config.get('max_components', 4)))
+  kept = [label for label, area in components if area >= min_component_area][:max_components]
+  if not kept:
+    return np.zeros(binary.shape, dtype=np.uint8), 0
+  return np.isin(labels, kept).astype(np.uint8), len(kept)
+
+
+def _sample_hull_edges(hull):
+  vertices = hull.reshape(-1, 2).astype(np.float64)
+  samples = []
+  for start, end in zip(vertices, np.roll(vertices, -1, axis=0)):
+    count = max(2, int(np.ceil(np.linalg.norm(end - start))) + 1)
+    samples.append(np.linspace(start, end, count, endpoint=False))
+  return np.vstack(samples)
+
+
+def _distance_to_triangle_edges(points, vertices):
+  lines = [
+    _line_from_points(np.vstack((vertices[index], vertices[(index + 1) % 3])))
+    for index in range(3)
+  ]
+  distances = np.column_stack([
+    np.abs(points @ line[:2] + line[2]) for line in lines
+  ])
+  return float(np.mean(np.min(distances, axis=1)))
 
 
 def _edge_fit(hull_points, seed_vertices):
@@ -105,36 +164,56 @@ def _standardize_vertices(vertices):
 
 def fit_triangle_vertices(mask, config=None):
   config = config or {}
-  mask = np.asarray(mask, dtype=np.uint8)
+  mask, component_count = _meaningful_components(mask, config)
   contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
   if not contours:
     return TriangleFit(False, 'TRIANGLE_FIT_FAILED', None, 0.0, None, None)
-  contour = max(contours, key=cv2.contourArea)
   min_area = float(config.get('min_contour_area_px', 200.0))
-  if cv2.contourArea(contour) < min_area:
+  if int(mask.sum()) < min_area:
     return TriangleFit(False, 'TRIANGLE_FIT_FAILED', None, 0.0, None, None)
-  hull = cv2.convexHull(contour)
+  # A single YOLO instance may contain two visible regions when the screwdriver
+  # occludes the plate.  Their joint hull reconstructs the hidden center while
+  # the component filter above prevents small mask artifacts from steering it.
+  hull = cv2.convexHull(np.vstack(contours))
   hull_points = hull.reshape(-1, 2).astype(np.float64)
   try:
     seed, method = _seed_triangle(hull)
     if method == 'hull_lines':
       vertices, fit_error = _edge_fit(hull_points, seed)
     else:
-      vertices, fit_error = seed, float(np.mean(np.min(np.column_stack([
-        np.abs(hull_points @ _line_from_points(np.vstack((seed[i], seed[(i + 1) % 3])))[:2]
-               + _line_from_points(np.vstack((seed[i], seed[(i + 1) % 3])))[2])
-        for i in range(3)
-      ]), axis=1)))
+      try:
+        vertices, fit_error = _edge_fit(_sample_hull_edges(hull), seed)
+        method = 'occlusion_hull_lines'
+      except (ValueError, np.linalg.LinAlgError):
+        vertices = seed
+        fit_error = _distance_to_triangle_edges(hull_points, seed)
+    if component_count > 1:
+      method = f'multi_component_{method}'
   except (ValueError, np.linalg.LinAlgError, cv2.error):
     return TriangleFit(False, 'TRIANGLE_FIT_FAILED', None, 0.0, None, None)
   vertices = _standardize_vertices(vertices)
-  iou = _triangle_iou(mask, vertices)
+  iou, visible_fraction, mask_containment = _triangle_overlap(mask, vertices)
+  min_iou = float(config.get('min_contour_iou', 0.45))
+  if component_count > 1:
+    min_iou = float(config.get('min_occluded_contour_iou', min_iou))
   valid = (
     np.isfinite(vertices).all()
-    and iou >= float(config.get('min_contour_iou', 0.45))
+    and iou >= min_iou
+    and visible_fraction >= float(config.get('min_visible_fraction', 0.25))
+    and mask_containment >= float(config.get('min_mask_containment', 0.85))
     and fit_error <= float(config.get('max_fit_error_px', 6.0))
   )
-  return TriangleFit(valid, None if valid else 'TRIANGLE_FIT_FAILED', vertices, iou, fit_error, method)
+  return TriangleFit(
+    valid,
+    None if valid else 'TRIANGLE_FIT_FAILED',
+    vertices,
+    iou,
+    fit_error,
+    method,
+    component_count,
+    visible_fraction,
+    mask_containment,
+  )
 
 
 def estimate_plate_pose(mask, plane_fit, K, baseline_m, config=None, previous_rotation=None):
@@ -144,6 +223,9 @@ def estimate_plate_pose(mask, plane_fit, K, baseline_m, config=None, previous_ro
     'triangle_iou': triangle.contour_iou,
     'triangle_fit_error_px': triangle.fit_error_px,
     'triangle_method': triangle.method,
+    'triangle_component_count': triangle.component_count,
+    'triangle_visible_fraction': triangle.visible_fraction,
+    'triangle_mask_containment': triangle.mask_containment,
   }
   if not triangle.valid:
     return PlatePose(False, triangle.invalid_reason, None, None, triangle.vertices_uv, None, metrics)
@@ -171,10 +253,6 @@ def estimate_plate_pose(mask, plane_fit, K, baseline_m, config=None, previous_ro
 
   try:
     origin, rotation = axes(points)
-    if np.dot(rotation[:, 2], origin) > 0:
-      points = points[[1, 0, 2]]
-      triangle.vertices_uv[:] = triangle.vertices_uv[[1, 0, 2]]
-      origin, rotation = axes(points)
   except (ValueError, FloatingPointError):
     return PlatePose(False, 'TRIANGLE_FIT_FAILED', None, None, triangle.vertices_uv, points, metrics)
 

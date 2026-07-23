@@ -1,5 +1,6 @@
-# Set configured=true only after measuring CAD coordinates or running robust
-# multi-view reprojection calibration. Plate coordinates and values use meters.
+# Set true only after dx/dy/dz have been measured in the fixed plate frame.
 configured: false
-source: null
-offset_m: [null, null, null]
+offset_m:
+  dx: 0.0
+  dy: 0.0
+  dz: 0.0

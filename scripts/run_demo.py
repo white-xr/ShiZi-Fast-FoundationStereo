@@ -61,10 +61,14 @@ def load_args(overrides=None):
   return OmegaConf.create(cfg)
 
 
-def configure_runtime():
+def configure_runtime(disable_torch_compile=False):
   set_logging_format()
   set_seed(0)
   torch.autograd.set_grad_enabled(False)
+  if disable_torch_compile:
+    from torch import _dynamo
+    _dynamo.config.disable = True
+    logging.info('torch.compile disabled; using eager PyTorch execution')
   cpu_threads = int(os.environ.get('FFS_CPU_THREADS', '2'))
   torch.set_num_threads(max(1, cpu_threads))
   try:
@@ -322,12 +326,14 @@ def run_pair_arrays(
     if crop_origin_xy is not None:
       K[0, 2] -= float(crop_origin_xy[0]) * scale
       K[1, 2] -= float(crop_origin_xy[1]) * scale
-    depth = np.zeros_like(disp_for_depth, dtype=np.float32)
-    valid_disp = np.isfinite(disp_for_depth) & (disp_for_depth > 1e-6)
-    depth[valid_disp] = K[0,0] * baseline / disp_for_depth[valid_disp]
-    if args.save_depth:
-      save_depth_outputs(depth, out_dir, args.zfar)
-    xyz_map = depth2xyzmap(depth, K)
+    if args.save_depth or args.get_pc:
+      depth = np.zeros_like(disp_for_depth, dtype=np.float32)
+      valid_disp = np.isfinite(disp_for_depth) & (disp_for_depth > 1e-6)
+      depth[valid_disp] = K[0,0] * baseline / disp_for_depth[valid_disp]
+      if args.save_depth:
+        save_depth_outputs(depth, out_dir, args.zfar)
+      if args.get_pc:
+        xyz_map = depth2xyzmap(depth, K)
 
   pcd = None
   if args.get_pc:

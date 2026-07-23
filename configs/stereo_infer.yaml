@@ -62,7 +62,7 @@ zfar: 0.5
 # YOLO 只跑 left_rgb；mask 保存为 left_rgb 原图尺寸；裁点云时映射到 FFS 的 xyz_map。
 segmentation:
   enabled: false
-  model_path: weights/triangle-metal.pt
+  model_path: weights/V2/best.pt
   imgsz: 960
   conf_thres: 0.35
   # 上次重启停在 yolo_seg 阶段，先让 YOLO 跑 CPU，避免它占 GPU。

@@ -3,6 +3,8 @@ locator:
   enabled: true
 
 model_dir: weights/23-36-37/model_best_bp2_serialize.pth
+# Real-time startup reads K/D/R/T from the active SDK profiles first.
+# This file is only the explicit factory-SDK fallback.
 stereo_calibration_file: configs/stereo_calib.yaml
 valid_iters: 8
 max_disp: 128
@@ -21,12 +23,16 @@ get_pc: 0
 zfar: 0.8
 
 camera:
-  source: orbbec_sdk_cpp
+  source: orbbec_py
   preset: Dual Color Streams
   stream: dual_color
+  serial_number: CV2L36000024
   width: 1280
   height: 800
-  fps: 10
+  fps: 30
+  formats: [RGB]
+  query_sdk_calibration: true
+  allow_calibration_fallback: true
   max_frames: 0
   interval_sec: 0
   preview: false
@@ -36,6 +42,7 @@ camera:
 
 segmentation:
   enabled: true
+  input_coordinate: raw_left
   model_path: weights/triangle-metal.pt
   imgsz: 960
   conf_thres: 0.35
@@ -61,6 +68,7 @@ rectification_quality:
   max_median_px: 0.5
   max_p95_px: 1.5
 synchronization:
+  require_timestamps: true
   max_delta_ms: 2.0
   max_frame_index_delta: 0
 roi:
@@ -88,12 +96,19 @@ plane:
 pose:
   min_contour_area_px: 500
   min_contour_iou: 0.45
+  min_occluded_contour_iou: 0.35
+  min_component_area_px: 32
+  min_component_area_ratio: 0.08
+  max_components: 4
+  min_visible_fraction: 0.25
+  min_mask_containment: 0.85
   max_fit_error_px: 6.0
   min_previous_normal_dot: 0.0
 screw:
   offset_file: configs/screw_offset.yaml
 output:
   jsonl_file: results.jsonl
+  latest_json_file: latest_result.json
   save_preview: false
 debug:
   enabled: false

@@ -71,8 +71,10 @@ def _base_result(frame):
     'plate_valid': False,
     'screw_valid': False,
     'plate_confidence': 0.0,
-    'screw_u': None,
-    'screw_v': None,
+    'screw_u_rect': None,
+    'screw_v_rect': None,
+    'screw_u_raw': None,
+    'screw_v_raw': None,
     'screw_xyz_camera_m': None,
     'plate_origin_camera_m': None,
     'plate_rotation_camera': None,
@@ -85,6 +87,7 @@ def _base_result(frame):
     'depth_rmse_mm': None,
     'spatial_coverage': 0.0,
     'quality_score': 0.0,
+    'ffs_valid_disparity_ratio': 0.0,
     'rectification': None,
     'timings_ms': {
       'capture_ms': float(frame.get('capture_ms', 0.0) or 0.0),
@@ -95,7 +98,7 @@ def _base_result(frame):
       'pose_ms': 0.0,
       'total_ms': 0.0,
     },
-    'invalid_reason': None,
+    'invalid_reason': '',
   }
 
 
@@ -106,11 +109,18 @@ class TriangleLocator:
     self.rectifier = rectifier
     self.config = config
     self.repo_dir = Path(repo_dir)
-    offset_path = (config.get('screw') or {}).get('offset_file')
-    if offset_path and not Path(offset_path).is_absolute():
-      offset_path = self.repo_dir / offset_path
-    self.screw_offset = load_screw_offset(offset_path)
+    screw_config = config.get('screw') or {}
+    self.screw_enabled = bool(screw_config.get('enabled', True))
+    if self.screw_enabled:
+      offset_path = screw_config.get('offset_file')
+      if offset_path and not Path(offset_path).is_absolute():
+        offset_path = self.repo_dir / offset_path
+      self.screw_offset = load_screw_offset(offset_path)
+    else:
+      self.screw_offset = None
     self.previous_rotation = None
+    self.last_target_mask = None
+    self.last_target_mask_coordinate = None
 
   def _finish(self, result, started, reason=None):
     if reason is not None:
@@ -123,9 +133,14 @@ class TriangleLocator:
   def process(self, frame, output_dir=None, debug=False, save_preview=False):
     started = time.perf_counter()
     result = _base_result(frame)
+    self.last_target_mask = None
+    self.last_target_mask_coordinate = None
     synchronization = self.config.get('synchronization') or {}
     delta = frame.get('timestamp_delta_ms')
-    if delta is None or float(delta) > float(synchronization.get('max_delta_ms', 2.0)):
+    require_timestamps = bool(synchronization.get('require_timestamps', True))
+    if (require_timestamps and delta is None) or (
+      delta is not None and float(delta) > float(synchronization.get('max_delta_ms', 2.0))
+    ):
       return self._finish(result, started, 'STEREO_NOT_SYNCHRONIZED')
     left_frame_id = frame.get('left_frame_id')
     right_frame_id = frame.get('right_frame_id')
@@ -154,9 +169,13 @@ class TriangleLocator:
         return self._finish(result, started, 'RECTIFICATION_INVALID')
 
     segmentation = self.config.get('segmentation') or {}
+    segmentation_coordinate = str(segmentation.get('input_coordinate', 'raw_left')).strip().lower()
+    if segmentation_coordinate not in {'raw_left', 'rectified_left'}:
+      raise ValueError(f'unsupported segmentation.input_coordinate: {segmentation_coordinate}')
+    segmentation_image = left_bgr if segmentation_coordinate == 'raw_left' else left_rect
     stage = time.perf_counter()
     masks = seg_pointcloud.run_yolo_seg_array(
-      left_rect,
+      segmentation_image,
       output_dir,
       segmentation,
       self.repo_dir,
@@ -165,12 +184,20 @@ class TriangleLocator:
     result['timings_ms']['yolo_ms'] = (time.perf_counter() - stage) * 1000.0
     result['plate_confidence'] = masks['plate_confidence']
     result['detection_valid'] = masks['detection_valid']
+    self.last_target_mask = np.asarray(
+      masks[seg_pointcloud.TARGET_CLASS], dtype=bool,
+    ).copy()
+    self.last_target_mask_coordinate = segmentation_coordinate
     if not masks['detection_valid']:
       return self._finish(result, started, masks['invalid_reason'])
 
+    target_mask = masks[seg_pointcloud.TARGET_CLASS]
+    if segmentation_coordinate == 'raw_left':
+      target_mask = self.rectifier.rectify_left_mask(target_mask)
+
     roi_config = self.config.get('roi') or {}
     bbox = seg_pointcloud.target_roi(
-      masks[seg_pointcloud.TARGET_CLASS],
+      target_mask,
       max_disp=float(self.model_args.max_disp) / float(self.model_args.scale),
       context_padding_px=int(roi_config.get('context_padding_px', 32)),
       padding_px=int(roi_config.get('padding_px', 0)),
@@ -181,7 +208,7 @@ class TriangleLocator:
     x0, y0, x1, y1 = bbox
     left_crop_bgr = left_rect[y0:y1, x0:x1]
     right_crop_bgr = right_rect[y0:y1, x0:x1]
-    target_crop = masks[seg_pointcloud.TARGET_CLASS][y0:y1, x0:x1]
+    target_crop = target_mask[y0:y1, x0:x1]
     K_roi = adjust_intrinsics_for_roi(self.rectifier.K, (x0, y0))
 
     sample_args = OmegaConf.create(OmegaConf.to_container(self.model_args, resolve=True))
@@ -204,6 +231,7 @@ class TriangleLocator:
       baseline_m=self.rectifier.baseline_m,
     )
     result['timings_ms']['ffs_ms'] = ffs_outputs['timings_ms']['ffs_ms']
+    result['ffs_valid_disparity_ratio'] = ffs_outputs['valid_disparity_ratio']
     if target_crop.shape != ffs_outputs['disp'].shape:
       target_crop = cv2.resize(
         target_crop.astype(np.uint8),
@@ -215,7 +243,12 @@ class TriangleLocator:
     plane_config = dict(self.config.get('plane') or {})
     plane_config.setdefault('max_disp', float(self.model_args.max_disp))
     plane = fit_disparity_plane(
-      ffs_outputs['disp'], target_crop, ffs_outputs['K'], self.rectifier.baseline_m, plane_config,
+      ffs_outputs['disp'],
+      target_crop,
+      ffs_outputs['K'],
+      self.rectifier.baseline_m,
+      plane_config,
+      validity_mask=ffs_outputs['valid_disparity_mask'],
     )
     result['timings_ms']['plane_ms'] = (time.perf_counter() - stage) * 1000.0
     result['valid_ratio'] = plane.metrics['valid_ratio']
@@ -254,6 +287,9 @@ class TriangleLocator:
     result['plate_vertices_left_uv'] = full_vertices
     result['quality_score'] *= float(np.clip(pose.metrics['triangle_iou'], 0.0, 1.0))
 
+    if not getattr(self, 'screw_enabled', True):
+      return self._finish(result, started)
+
     screw = locate_screw(
       pose.R,
       pose.t,
@@ -261,15 +297,29 @@ class TriangleLocator:
       self.rectifier.K,
       (self.rectifier.calibration.image_width, self.rectifier.calibration.image_height),
     )
-    result['screw_valid'] = screw['valid']
     result['screw_xyz_camera_m'] = screw['xyz_camera_m']
-    result['screw_u'] = screw['u']
-    result['screw_v'] = screw['v']
+    result['screw_valid'] = screw['valid']
+    result['screw_u_rect'] = screw['u']
+    result['screw_v_rect'] = screw['v']
+    screw_reason = screw['invalid_reason']
+    if screw['valid']:
+      raw_uv = self.rectifier.left_rectified_to_raw([[screw['u'], screw['v']]])[0]
+      raw_valid = (
+        np.isfinite(raw_uv).all()
+        and 0 <= raw_uv[0] < self.rectifier.calibration.image_width
+        and 0 <= raw_uv[1] < self.rectifier.calibration.image_height
+      )
+      if raw_valid:
+        result['screw_u_raw'] = float(raw_uv[0])
+        result['screw_v_raw'] = float(raw_uv[1])
+      else:
+        result['screw_valid'] = False
+        screw_reason = 'PROJECTION_OUT_OF_IMAGE'
     if (debug or save_preview) and output_dir is not None:
       Path(output_dir).mkdir(parents=True, exist_ok=True)
       preview = left_rect.copy()
       cv2.polylines(preview, [np.round(full_vertices).astype(np.int32)], True, (0, 255, 0), 2)
-      if screw['valid']:
+      if result['screw_valid']:
         cv2.drawMarker(preview, (round(screw['u']), round(screw['v'])), (0, 0, 255), cv2.MARKER_CROSS, 18, 2)
       cv2.imwrite(str(Path(output_dir) / 'locator_preview.jpg'), preview)
-    return self._finish(result, started, screw['invalid_reason'])
+    return self._finish(result, started, screw_reason)

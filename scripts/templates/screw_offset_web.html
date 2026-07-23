@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>三角板三维姿态查看器</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, "Microsoft YaHei", system-ui, sans-serif;
+      color: #1e252b;
+      background: #e9edf0;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; }
+    button, select, input { font: inherit; }
+    header {
+      height: 58px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 0 18px;
+      background: #182127;
+      color: #f4f7f8;
+      border-bottom: 1px solid #303b42;
+    }
+    h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: 0; }
+    .connection { color: #a9c7be; font-size: 13px; overflow-wrap: anywhere; }
+    .toolbar {
+      min-height: 50px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      background: #f8fafb;
+      border-bottom: 1px solid #cbd2d7;
+    }
+    select {
+      height: 34px;
+      min-width: 145px;
+      border: 1px solid #aeb8bf;
+      border-radius: 4px;
+      padding: 0 28px 0 9px;
+      background: #fff;
+    }
+    .dataset-path {
+      height: 34px;
+      flex: 1 1 420px;
+      min-width: 220px;
+      max-width: 720px;
+      border: 1px solid #aeb8bf;
+      border-radius: 4px;
+      padding: 0 9px;
+      background: #fff;
+    }
+    button {
+      min-height: 34px;
+      border: 1px solid #aeb8bf;
+      border-radius: 4px;
+      padding: 0 12px;
+      color: #263138;
+      background: #fff;
+      cursor: pointer;
+    }
+    button:hover { background: #edf2f3; }
+    button:disabled { opacity: .55; cursor: wait; }
+    button.primary { border-color: #176b5b; background: #176b5b; color: #fff; }
+    .icon-button { width: 36px; padding: 0; font-size: 22px; line-height: 1; }
+    .spacer { flex: 1; }
+    .count { color: #64717a; font-size: 13px; }
+    .segments { display: inline-flex; border: 1px solid #aeb8bf; border-radius: 4px; overflow: hidden; }
+    .segments button { border: 0; border-radius: 0; min-height: 32px; }
+    .segments button.active { color: #fff; background: #3d515b; }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 390px;
+      min-height: calc(100vh - 108px);
+    }
+    .viewer {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      background: #0d1317;
+    }
+    .image-stage {
+      flex: 1;
+      min-height: 500px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: auto;
+      padding: 16px;
+    }
+    .image-pair {
+      width: 100%;
+      max-height: calc(100vh - 188px);
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      align-items: start;
+    }
+    .image-card { min-width: 0; }
+    .image-label {
+      padding: 6px 8px;
+      color: #d9e0e5;
+      background: #20292f;
+      border: 1px solid #3a454c;
+      border-bottom: 0;
+      font-size: 12px;
+    }
+    #poseImage, #yoloImage {
+      display: block;
+      width: auto;
+      height: auto;
+      max-width: 100%;
+      max-height: calc(100vh - 224px);
+      object-fit: contain;
+      background: #050708;
+    }
+    .viewer-footer {
+      min-height: 54px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 8px 14px;
+      color: #d9e0e5;
+      background: #20292f;
+      border-top: 1px solid #3a454c;
+    }
+    #statusText { overflow-wrap: anywhere; }
+    .badge { white-space: nowrap; padding: 4px 7px; border-radius: 3px; background: #45545d; font-size: 12px; }
+    .badge.valid { background: #17775e; }
+    .badge.invalid { background: #a33d3d; }
+    .busy {
+      position: absolute;
+      inset: 0;
+      display: none;
+      place-items: center;
+      background: rgba(7, 11, 14, .76);
+      color: #fff;
+      font-size: 17px;
+      z-index: 4;
+    }
+    .busy.visible { display: grid; }
+    aside {
+      background: #fff;
+      border-left: 1px solid #c9d0d5;
+      overflow-y: auto;
+    }
+    .panel { padding: 14px 16px; border-bottom: 1px solid #d9dee2; }
+    h2 { margin: 0 0 10px; font-size: 14px; font-weight: 700; letter-spacing: 0; }
+    .axis-legend { display: flex; flex-wrap: wrap; gap: 12px; color: #59666e; font-size: 12px; }
+    .swatch { width: 10px; height: 10px; display: inline-block; margin-right: 5px; }
+    .x { background: #eb3333; }
+    .y { background: #35be35; }
+    .z { background: #1e66e1; }
+    .o { background: #e0c500; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { padding: 6px 5px; border-bottom: 1px solid #e3e7e9; text-align: right; font-size: 12px; }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: #68757d; font-weight: 650; }
+    .matrix td { text-align: right; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .metrics { display: grid; grid-template-columns: 1fr auto; gap: 7px 12px; font-size: 13px; }
+    .metrics span:nth-child(odd) { color: #64717a; }
+    .metrics span:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
+    .reason { margin-top: 10px; padding: 8px 9px; border-left: 3px solid #a33d3d; background: #f7eded; color: #772c2c; overflow-wrap: anywhere; }
+    .hidden { display: none; }
+    @media (max-width: 920px) {
+      header { height: auto; align-items: flex-start; flex-direction: column; padding: 11px 13px; }
+      .toolbar { flex-wrap: wrap; }
+      main { grid-template-columns: 1fr; }
+      aside { border-left: 0; border-top: 1px solid #c9d0d5; }
+      .image-stage { min-height: 360px; }
+      .image-pair { grid-template-columns: 1fr; max-height: none; }
+      #poseImage, #yoloImage { max-height: 64vh; width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>三角板三维姿态查看器</h1>
+    <div class="connection" id="connectionText">正在连接 Linux 服务...</div>
+  </header>
+
+  <div class="toolbar">
+    <input id="datasetPath" class="dataset-path" type="text" aria-label="数据集路径" placeholder="Linux 数据集路径">
+    <button id="loadDatasetButton">加载数据集</button>
+    <select id="imageSelect" aria-label="离线图像"></select>
+    <button id="prevButton" class="icon-button" title="上一张" aria-label="上一张">‹</button>
+    <button id="nextButton" class="icon-button" title="下一张" aria-label="下一张">›</button>
+    <button id="inferButton" class="primary">恢复三维姿态</button>
+    <span class="count" id="imageCount"></span>
+    <span class="spacer"></span>
+  </div>
+
+  <main>
+    <section class="viewer">
+      <div class="image-stage">
+        <div class="image-pair">
+          <div class="image-card">
+            <div class="image-label">原图 + 三维姿态</div>
+            <img id="poseImage" alt="左相机图像和三维姿态">
+          </div>
+          <div class="image-card">
+            <div class="image-label">仅 YOLO 分割</div>
+            <img id="yoloImage" alt="YOLO target_plate 分割掩码">
+          </div>
+        </div>
+      </div>
+      <div class="busy" id="busyLayer">正在运行 YOLO + FFS + 三维姿态恢复...</div>
+      <div class="viewer-footer">
+        <span id="statusText">等待图像</span>
+        <span class="badge" id="validBadge">未运行</span>
+      </div>
+    </section>
+
+    <aside>
+      <section class="panel">
+        <h2>局部坐标系</h2>
+        <div class="axis-legend">
+          <span><i class="swatch x"></i>X：A → B</span>
+          <span><i class="swatch y"></i>Y：底边中点 → C</span>
+          <span><i class="swatch z"></i>Z：X × Y</span>
+          <span><i class="swatch o"></i>O：三顶点均值</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>三维顶点，相机坐标 mm</h2>
+        <table>
+          <thead><tr><th>顶点</th><th>X</th><th>Y</th><th>Z</th></tr></thead>
+          <tbody id="vertexRows"></tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <h2>局部原点，相机坐标 mm</h2>
+        <table><tbody id="originRows"></tbody></table>
+      </section>
+
+      <section class="panel">
+        <h2>旋转矩阵 R（局部 → 相机）</h2>
+        <table class="matrix"><tbody id="rotationRows"></tbody></table>
+      </section>
+
+      <section class="panel">
+        <h2>质量</h2>
+        <div class="metrics" id="qualityMetrics"></div>
+        <div class="reason hidden" id="invalidReason"></div>
+      </section>
+    </aside>
+  </main>
+
+  <script>
+    const appState = {
+      images: [],
+      selected: null,
+      frame: null,
+      view: 'raw_pose',
+      gpuConfirmed: false,
+      validIters: 0,
+      maxDisp: 0,
+    };
+
+    const imageSelect = document.getElementById('imageSelect');
+    const datasetPath = document.getElementById('datasetPath');
+    const poseImage = document.getElementById('poseImage');
+    const yoloImage = document.getElementById('yoloImage');
+    const statusText = document.getElementById('statusText');
+    const validBadge = document.getElementById('validBadge');
+    const busyLayer = document.getElementById('busyLayer');
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: {'Content-Type': 'application/json', ...(options.headers || {})},
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      return payload;
+    }
+
+    function format(value, digits = 3) {
+      return value === null || value === undefined || !Number.isFinite(Number(value))
+        ? '—'
+        : Number(value).toFixed(digits);
+    }
+
+    function setBusy(value) {
+      busyLayer.classList.toggle('visible', value);
+      document.querySelectorAll('button, select, input').forEach(element => element.disabled = value);
+    }
+
+    function showError(error) {
+      statusText.textContent = `错误：${error.message || error}`;
+      window.alert(error.message || error);
+    }
+
+    function emptyRows(count, columns) {
+      return Array.from({length: count}, (_, row) =>
+        `<tr>${Array.from({length: columns}, (_, col) => `<td>${col === 0 ? ['A','B','C'][row] || '—' : '—'}</td>`).join('')}</tr>`
+      ).join('');
+    }
+
+    function renderFrame(frame) {
+      appState.frame = frame;
+      const valid = Boolean(frame.plate_valid);
+      validBadge.textContent = !frame.inferred ? '未运行' : valid ? '姿态有效' : '姿态无效';
+      validBadge.className = `badge ${!frame.inferred ? '' : valid ? 'valid' : 'invalid'}`;
+      statusText.textContent = !frame.inferred
+        ? '当前图像尚未恢复姿态'
+        : valid
+          ? `三维姿态恢复完成，质量 ${format(frame.quality_score)}`
+          : `三维姿态无效：${frame.invalid_reason || 'UNKNOWN'}`;
+
+      const vertices = frame.vertices_camera_mm;
+      document.getElementById('vertexRows').innerHTML = vertices
+        ? vertices.map((point, index) => `<tr><td>${['A','B','C'][index]}</td><td>${format(point[0])}</td><td>${format(point[1])}</td><td>${format(point[2])}</td></tr>`).join('')
+        : emptyRows(3, 4);
+
+      const origin = frame.origin_camera_mm;
+      document.getElementById('originRows').innerHTML = ['X','Y','Z'].map((axis, index) =>
+        `<tr><th>${axis}</th><td>${origin ? format(origin[index]) : '—'}</td></tr>`
+      ).join('');
+
+      const rotation = frame.rotation_camera;
+      document.getElementById('rotationRows').innerHTML = rotation
+        ? rotation.map(row => `<tr>${row.map(value => `<td>${format(value, 6)}</td>`).join('')}</tr>`).join('')
+        : Array.from({length: 3}, () => '<tr><td>—</td><td>—</td><td>—</td></tr>').join('');
+
+      const metrics = [
+        ['质量分数', format(frame.quality_score)],
+        ['有效视差比例', format(frame.valid_ratio)],
+        ['平面内点比例', format(frame.inlier_ratio)],
+        ['空间覆盖率', format(frame.spatial_coverage)],
+        ['平面 RMSE / px', format(frame.plane_rmse_px)],
+      ];
+      document.getElementById('qualityMetrics').innerHTML = metrics
+        .map(([label, value]) => `<span>${label}</span><span>${value}</span>`).join('');
+      const reason = document.getElementById('invalidReason');
+      reason.textContent = frame.invalid_reason || '';
+      reason.classList.toggle('hidden', !frame.inferred || valid || !frame.invalid_reason);
+    }
+
+    function refreshImage() {
+      if (!appState.selected) return;
+      poseImage.src = `/api/image/${encodeURIComponent(appState.selected)}.jpg?view=${appState.view}&t=${Date.now()}`;
+      yoloImage.src = `/api/image/${encodeURIComponent(appState.selected)}.yolo.jpg?t=${Date.now()}`;
+    }
+
+    async function loadFrame(name) {
+      appState.selected = name;
+      imageSelect.value = name;
+      try {
+        const frame = await api(`/api/frame/${encodeURIComponent(name)}`);
+        renderFrame(frame);
+        refreshImage();
+      } catch (error) { showError(error); }
+    }
+
+    imageSelect.addEventListener('change', () => loadFrame(imageSelect.value));
+    document.getElementById('prevButton').addEventListener('click', () => {
+      if (!appState.images.length) return;
+      const index = appState.images.indexOf(appState.selected);
+      loadFrame(appState.images[(index - 1 + appState.images.length) % appState.images.length]);
+    });
+    document.getElementById('nextButton').addEventListener('click', () => {
+      if (!appState.images.length) return;
+      const index = appState.images.indexOf(appState.selected);
+      loadFrame(appState.images[(index + 1) % appState.images.length]);
+    });
+
+    async function applyDatasetState(state) {
+      appState.images = state.images;
+      appState.selected = state.selected;
+      appState.validIters = state.valid_iters;
+      appState.maxDisp = state.max_disp;
+      imageSelect.innerHTML = state.images.map(name => `<option value="${name}">${name}</option>`).join('');
+      document.getElementById('imageCount').textContent = `共 ${state.images.length} 对`;
+      document.getElementById('connectionText').textContent = state.data_dir;
+      datasetPath.value = state.data_dir;
+      await loadFrame(state.selected);
+    }
+
+    document.getElementById('loadDatasetButton').addEventListener('click', async () => {
+      setBusy(true);
+      try {
+        const state = await api('/api/dataset', {
+          method: 'POST',
+          body: JSON.stringify({data_dir: datasetPath.value}),
+        });
+        await applyDatasetState(state);
+      } catch (error) { showError(error); }
+      finally { setBusy(false); }
+    });
+
+    datasetPath.addEventListener('keydown', event => {
+      if (event.key === 'Enter') document.getElementById('loadDatasetButton').click();
+    });
+
+    document.getElementById('inferButton').addEventListener('click', async () => {
+      if (!appState.gpuConfirmed) {
+        const accepted = window.confirm(
+          `将运行 YOLO + FFS 姿态推理。\n\nvalid_iters=${appState.validIters}，max_disp=${appState.maxDisp}\n\n确认当前硬件状态稳定。`
+        );
+        if (!accepted) return;
+        appState.gpuConfirmed = true;
+      }
+      setBusy(true);
+      try {
+        const frame = await api(`/api/infer/${encodeURIComponent(appState.selected)}`, {method: 'POST', body: '{}'});
+        renderFrame(frame);
+        appState.view = 'raw_pose';
+        refreshImage();
+      } catch (error) { showError(error); }
+      finally { setBusy(false); }
+    });
+
+    async function initialize() {
+      try {
+        const state = await api('/api/state');
+        await applyDatasetState(state);
+      } catch (error) { showError(error); }
+    }
+
+    initialize();
+  </script>
+</body>
+</html>

@@ -5,6 +5,20 @@ import numpy as np
 import yaml
 
 
+def _offset_values(value, field_name):
+  if isinstance(value, dict):
+    value = [value.get('dx'), value.get('dy'), value.get('dz')]
+  if value is None:
+    return None
+  try:
+    items = list(value)
+  except TypeError as exc:
+    raise ValueError(f'{field_name} must provide dx/dy/dz') from exc
+  if len(items) != 3 or any(item is None for item in items):
+    raise ValueError(f'{field_name} must provide dx/dy/dz')
+  return np.asarray(items, dtype=np.float64).reshape(3)
+
+
 def load_screw_offset(path):
   if path in {None, '', 'null'}:
     return None
@@ -15,15 +29,42 @@ def load_screw_offset(path):
     data = json.load(stream) if path.suffix.lower() == '.json' else (yaml.safe_load(stream) or {})
   if not bool(data.get('configured', False)):
     return None
-  value = data.get('offset_m')
-  if value is None:
-    value = [data.get('dx'), data.get('dy'), data.get('dz')]
-  if any(item is None for item in value):
-    raise ValueError('configured screw offset must provide dx/dy/dz in meters')
-  offset = np.asarray(value, dtype=np.float64).reshape(3)
+  if data.get('offset_mm') is not None:
+    offset = _offset_values(data['offset_mm'], 'offset_mm') / 1000.0
+  elif data.get('offset_m') is not None:
+    offset = _offset_values(data['offset_m'], 'offset_m')
+  else:
+    offset = _offset_values([data.get('dx'), data.get('dy'), data.get('dz')], 'dx/dy/dz')
   if not np.isfinite(offset).all() or np.linalg.norm(offset) <= 1e-12:
     raise ValueError('configured screw offset must be finite and cannot be an all-zero placeholder')
   return offset
+
+
+def save_screw_offset_mm(path, offset_mm, source='manual', metadata=None):
+  offset = np.asarray(offset_mm, dtype=np.float64).reshape(3)
+  if not np.isfinite(offset).all() or np.linalg.norm(offset) <= 1e-9:
+    raise ValueError('screw offset in millimeters must be finite and cannot be all zero')
+  payload = {
+    'configured': True,
+    'source': str(source),
+    'offset_m': {
+      'dx': float(offset[0] / 1000.0),
+      'dy': float(offset[1] / 1000.0),
+      'dz': float(offset[2] / 1000.0),
+    },
+  }
+  if metadata:
+    payload.update({
+      key: value for key, value in metadata.items()
+      if key not in {'configured', 'source', 'offset_mm', 'offset_m'}
+    })
+  path = Path(path)
+  path.parent.mkdir(parents=True, exist_ok=True)
+  if path.suffix.lower() == '.json':
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+  else:
+    path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
+  return path
 
 
 def locate_screw(R, t, offset_m, K, image_size):

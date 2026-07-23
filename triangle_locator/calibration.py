@@ -21,6 +21,7 @@ class StereoCalibration:
   R: np.ndarray
   T: np.ndarray
   baseline_m: float
+  source: str = 'configuration file'
 
   @property
   def image_size(self):
@@ -71,7 +72,82 @@ def load_stereo_calibration(path):
       f'baseline_m={baseline:.9f} disagrees with norm(T)={measured_baseline:.9f}; '
       'both must use meters'
     )
-  return StereoCalibration(width, height, K1, D1, K2, D2, R, T, baseline)
+  return StereoCalibration(
+    width, height, K1, D1, K2, D2, R, T, baseline,
+    source=str(data.get('source') or path),
+  )
+
+
+def _video_profile(profile):
+  converter = getattr(profile, 'as_video_stream_profile', None)
+  return converter() if converter is not None else profile
+
+
+def _sdk_intrinsic_matrix(value):
+  return np.array([
+    [float(value.fx), 0.0, float(value.cx)],
+    [0.0, float(value.fy), float(value.cy)],
+    [0.0, 0.0, 1.0],
+  ], dtype=np.float64)
+
+
+def _sdk_distortion_vector(value):
+  # OpenCV rational Brown-Conrady order, not the SDK display order.
+  return np.array([
+    float(value.k1), float(value.k2), float(value.p1), float(value.p2),
+    float(value.k3), float(value.k4), float(value.k5), float(value.k6),
+  ], dtype=np.float64)
+
+
+def stereo_calibration_from_sdk_profiles(left_profile, right_profile, source='Orbbec SDK Dual RGB profiles'):
+  left = _video_profile(left_profile)
+  right = _video_profile(right_profile)
+  left_intrinsic = left.get_intrinsic()
+  right_intrinsic = right.get_intrinsic()
+  if (int(left_intrinsic.width), int(left_intrinsic.height)) != (
+      int(right_intrinsic.width), int(right_intrinsic.height)):
+    raise CalibrationError('Orbbec left/right Dual RGB profile sizes do not match')
+
+  extrinsic = left.get_extrinsic_to(right)
+  translation = np.asarray(extrinsic.transform, dtype=np.float64).reshape(3)
+  # Orbbec SDK commonly reports transform translation in millimeters.
+  if np.linalg.norm(translation) > 1.0:
+    translation /= 1000.0
+  baseline = float(np.linalg.norm(translation))
+  if not 0.001 <= baseline <= 1.0:
+    raise CalibrationError(f'Orbbec SDK returned an implausible stereo baseline: {baseline} m')
+
+  return StereoCalibration(
+    image_width=int(left_intrinsic.width),
+    image_height=int(left_intrinsic.height),
+    K1=_sdk_intrinsic_matrix(left_intrinsic),
+    D1=_sdk_distortion_vector(left.get_distortion()),
+    K2=_sdk_intrinsic_matrix(right_intrinsic),
+    D2=_sdk_distortion_vector(right.get_distortion()),
+    R=np.asarray(extrinsic.rot, dtype=np.float64).reshape(3, 3),
+    T=translation.reshape(3, 1),
+    baseline_m=baseline,
+    source=str(source),
+  )
+
+
+def stereo_calibration_payload(calibration, **metadata):
+  payload = {
+    'configured': True,
+    'source': calibration.source,
+    'image_width': calibration.image_width,
+    'image_height': calibration.image_height,
+    'K1': calibration.K1.tolist(),
+    'D1': calibration.D1.reshape(1, -1).tolist(),
+    'K2': calibration.K2.tolist(),
+    'D2': calibration.D2.reshape(1, -1).tolist(),
+    'R': calibration.R.tolist(),
+    'T': calibration.T.tolist(),
+    'baseline_m': calibration.baseline_m,
+    'transform_convention': 'P_right = R @ P_left + T',
+  }
+  payload.update(metadata)
+  return payload
 
 
 def adjust_intrinsics_for_roi(K, roi_xy, scale=1.0):
@@ -85,9 +161,24 @@ def adjust_intrinsics_for_roi(K, roi_xy, scale=1.0):
 
 
 class StereoRectifier:
-  def __init__(self, calibration, alpha=0.0, map_type=cv2.CV_32FC1):
+  def __init__(self, calibration, alpha=0.0, map_type=cv2.CV_32FC1, enabled=True):
     self.calibration = calibration
+    self.enabled = bool(enabled)
     size = calibration.image_size
+    if not self.enabled:
+      self.R1 = np.eye(3, dtype=np.float64)
+      self.R2 = np.eye(3, dtype=np.float64)
+      self.P1 = np.column_stack((calibration.K1, np.zeros(3, dtype=np.float64)))
+      self.P2 = self.P1.copy()
+      self.P2[0, 3] = -calibration.K1[0, 0] * calibration.baseline_m
+      self.Q = None
+      self.roi1 = (0, 0, calibration.image_width, calibration.image_height)
+      self.roi2 = self.roi1
+      self.left_map = None
+      self.right_map = None
+      self.K = calibration.K1.copy()
+      self.baseline_m = calibration.baseline_m
+      return
     self.R1, self.R2, self.P1, self.P2, self.Q, self.roi1, self.roi2 = cv2.stereoRectify(
       calibration.K1,
       calibration.D1,
@@ -112,8 +203,8 @@ class StereoRectifier:
     self.baseline_m = rectified_baseline
 
   @classmethod
-  def from_file(cls, path, alpha=0.0):
-    return cls(load_stereo_calibration(path), alpha=alpha)
+  def from_file(cls, path, alpha=0.0, enabled=True):
+    return cls(load_stereo_calibration(path), alpha=alpha, enabled=enabled)
 
   def rectify(self, left, right):
     expected = (self.calibration.image_height, self.calibration.image_width)
@@ -122,9 +213,46 @@ class StereoRectifier:
         f'input image size must be {expected[1]}x{expected[0]}, '
         f'got left={left.shape[1]}x{left.shape[0]} right={right.shape[1]}x{right.shape[0]}'
       )
+    if not self.enabled:
+      return left, right
     left_rect = cv2.remap(left, self.left_map[0], self.left_map[1], cv2.INTER_LINEAR)
     right_rect = cv2.remap(right, self.right_map[0], self.right_map[1], cv2.INTER_LINEAR)
     return left_rect, right_rect
+
+  def rectify_left_mask(self, raw_mask):
+    expected = (self.calibration.image_height, self.calibration.image_width)
+    raw_mask = np.asarray(raw_mask, dtype=np.uint8)
+    if raw_mask.shape != expected:
+      raise ValueError(
+        f'left mask size must be {expected[1]}x{expected[0]}, '
+        f'got {raw_mask.shape[1]}x{raw_mask.shape[0]}'
+      )
+    if not self.enabled:
+      return raw_mask.astype(bool)
+    return cv2.remap(
+      raw_mask,
+      self.left_map[0],
+      self.left_map[1],
+      cv2.INTER_NEAREST,
+      borderMode=cv2.BORDER_CONSTANT,
+      borderValue=0,
+    ).astype(bool)
+
+  def left_rectified_to_raw(self, pixels):
+    pixels = np.asarray(pixels, dtype=np.float64).reshape(-1, 2)
+    if not self.enabled:
+      return pixels.copy()
+    homogeneous = np.column_stack((pixels, np.ones(len(pixels), dtype=np.float64)))
+    rectified_rays = (np.linalg.inv(self.K) @ homogeneous.T).T
+    raw_rays = (self.R1.T @ rectified_rays.T).T
+    projected, _ = cv2.projectPoints(
+      raw_rays.reshape(-1, 1, 3),
+      np.zeros(3, dtype=np.float64),
+      np.zeros(3, dtype=np.float64),
+      self.calibration.K1,
+      self.calibration.D1,
+    )
+    return projected.reshape(-1, 2)
 
 
 def measure_vertical_epipolar_error(left, right, config=None):

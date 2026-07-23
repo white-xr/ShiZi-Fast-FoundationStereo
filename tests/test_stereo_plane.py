@@ -54,6 +54,24 @@ def test_mask_erosion_and_valid_ratio():
   assert result.metrics['valid_ratio'] == 0.0
 
 
+def test_ffs_validity_mask_excludes_invisible_disparity():
+  disparity = np.full((40, 40), 20.0, dtype=np.float32)
+  mask = np.ones(disparity.shape, dtype=bool)
+  validity = np.zeros(disparity.shape, dtype=bool)
+  K = np.array([[500.0, 0, 20], [0, 500.0, 20], [0, 0, 1]])
+  result = fit_disparity_plane(
+    disparity,
+    mask,
+    K,
+    0.02,
+    {'erode_px': 0, 'min_points': 10},
+    validity_mask=validity,
+  )
+  assert not result.valid
+  assert result.invalid_reason == 'INSUFFICIENT_DISPARITY'
+  assert result.metrics['valid_pixels'] == 0
+
+
 def test_pixel_rays_intersect_fitted_disparity_plane():
   K = np.array([[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]])
   coefficients = np.array([0.01, -0.02, 30.0])

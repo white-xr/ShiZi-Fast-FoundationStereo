@@ -3,9 +3,8 @@ import json
 from pathlib import Path
 
 import numpy as np
-import yaml
 
-from triangle_locator.screw_locator import calibrate_offset_from_observations
+from triangle_locator.screw_locator import calibrate_offset_from_observations, save_screw_offset_mm
 
 
 def parse_args():
@@ -52,10 +51,7 @@ def main():
     raise RuntimeError(
       f'validation RMSE {validation_rmse:.3f}px exceeds {args.max_validation_rmse_px:.3f}px; offset not saved'
     )
-  payload = {
-    'configured': True,
-    'source': 'robust multi-view 2D reprojection calibration',
-    'offset_m': offset.tolist(),
+  metadata = {
     'train_views': len(train),
     'train_inlier_views': int(np.count_nonzero(result.inlier_mask)),
     'train_rmse_px': float(np.sqrt(np.mean(np.square(train_errors)))),
@@ -63,8 +59,12 @@ def main():
     'validation_rmse_px': validation_rmse,
   }
   output = Path(args.output)
-  output.parent.mkdir(parents=True, exist_ok=True)
-  output.write_text(yaml.safe_dump(payload, sort_keys=False), encoding='utf-8')
+  save_screw_offset_mm(
+    output,
+    offset * 1000.0,
+    source='robust multi-view 2D reprojection calibration',
+    metadata=metadata,
+  )
   print(f'Wrote {output}; validation_rmse_px={validation_rmse:.3f}')
 
 
